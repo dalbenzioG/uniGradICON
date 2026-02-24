@@ -57,8 +57,8 @@ def validate_dataset_consistency(configs: List[Dict[str, Any]]) -> str:
     Returns: 'standard' for datasets without segmentation, 'segmentation' for datasets with segmentation
     Raises: ValueError if datasets are mixed
     """
-    seg_types = {'unpaired_with_seg', 'paired_with_seg'}
-    standard_types = {'unpaired', 'paired'}
+    seg_types = {'unpaired_with_seg', 'paired_with_seg', 'paired_ct_us_seg'}
+    standard_types = {'unpaired', 'paired', 'paired_ct_us'}
     
     dataset_types = [ds['type'] for ds in configs]
     
@@ -69,8 +69,8 @@ def validate_dataset_consistency(configs: List[Dict[str, Any]]) -> str:
         raise ValueError(
             "Cannot mix dataset types with and without segmentations in the same config. "
             f"Found types: {dataset_types}. "
-            "Use either all standard types (unpaired, paired) or all segmentation types "
-            "(unpaired_with_seg, paired_with_seg)."
+            "Use either all standard types (unpaired, paired, paired_ct_us) or all segmentation types "
+            "(unpaired_with_seg, paired_with_seg, paired_ct_us_seg)."
         )
     
     if has_seg:
@@ -86,6 +86,8 @@ def create_dataset_from_config(dataset_config: Dict[str, Any], input_shape: Tupl
     - PairedDataset  
     - ImageSegmentationDataset (unpaired_with_seg)
     - PairedImageSegmentationDataset (paired_with_seg)
+    - PairedCTUSDataset (paired_ct_us)
+    - PairedCTUSSegmentationDataset (paired_ct_us_seg)
     """
     dataset_type = dataset_config['type']
     
@@ -126,5 +128,50 @@ def create_dataset_from_config(dataset_config: Dict[str, Any], input_shape: Tupl
     elif dataset_type == 'paired_with_seg':
         return dataset.PairedImageSegmentationDataset(**common_params)
     
+    elif dataset_type == 'paired_ct_us':
+        affine_dir = dataset_config.get('affine_transforms_dir')
+        if config_dir and affine_dir and not os.path.isabs(affine_dir):
+            affine_dir = os.path.join(config_dir, affine_dir)
+        ct_us_params = {
+            'input_shape': input_shape,
+            'name': dataset_config['name'],
+            'data': common_params['data'],
+            'read_type': common_params['read_type'],
+            'cache_filename': common_params['cache_filename'],
+            'maximum_images': common_params['maximum_images'],
+            'shuffle': common_params['shuffle'],
+            'use_cache': common_params['use_cache'],
+            'ct_window': tuple(dataset_config.get('ct_window', [-1000, 1000])),
+            'quantile_range': tuple(dataset_config.get('quantile_range', [0.01, 0.99])),
+            'affine_transforms_dir': affine_dir,
+            'affine_direction': dataset_config.get('affine_direction', 'us_to_ct'),
+            'affine_type': dataset_config.get('affine_type', 'rigid_mask'),
+        }
+        return dataset.PairedCTUSDataset(**ct_us_params)
+    
+    elif dataset_type == 'paired_ct_us_seg':
+        affine_dir = dataset_config.get('affine_transforms_dir')
+        if config_dir and affine_dir and not os.path.isabs(affine_dir):
+            affine_dir = os.path.join(config_dir, affine_dir)
+        ct_us_seg_params = {
+            'input_shape': input_shape,
+            'name': dataset_config['name'],
+            'data': common_params['data'],
+            'read_type': common_params['read_type'],
+            'cache_filename': common_params['cache_filename'],
+            'maximum_images': common_params['maximum_images'],
+            'shuffle': common_params['shuffle'],
+            'use_cache': common_params['use_cache'],
+            'ct_window': tuple(dataset_config.get('ct_window', [-1000, 1000])),
+            'quantile_range': tuple(dataset_config.get('quantile_range', [0.01, 0.99])),
+            'affine_transforms_dir': affine_dir,
+            'affine_direction': dataset_config.get('affine_direction', 'us_to_ct'),
+            'affine_type': dataset_config.get('affine_type', 'rigid_mask'),
+        }
+        return dataset.PairedCTUSSegmentationDataset(**ct_us_seg_params)
+    
     else:
-        raise ValueError(f"Unknown dataset type: {dataset_type}. Must be one of: unpaired, paired, unpaired_with_seg, paired_with_seg")
+        raise ValueError(
+            f"Unknown dataset type: {dataset_type}. Must be one of: unpaired, paired, "
+            "unpaired_with_seg, paired_with_seg, paired_ct_us, paired_ct_us_seg"
+        )

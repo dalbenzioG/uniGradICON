@@ -9,6 +9,7 @@ import icon_registration as icon
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from icon_registration.losses import to_floats
+import wandb
 import unigradicon
 
 
@@ -97,11 +98,11 @@ def get_loss_function(similarity_type, sigma=5, mind_radius=2, mind_dilation=2):
 
 def finetune_multi_standard(input_shape, data_loader, val_data_loaders_dict, GPUS, device_ids, 
                            epochs, eval_period, save_period, learning_rate, weights_path,
-                           lmbda=1.5, loss_fn=None, dice_loss_weight=0.0):
+                           lmbda=1.5, loss_fn=None, dice_loss_weight=0.0, use_wandb=True, use_tensorboard=True):
     """
     Finetuning with multiple datasets (standard mode: no segmentations).
     Handles datasets that return 2 outputs: (moving_image, fixed_image).
-    
+
     Args:
         input_shape: Shape of input images
         data_loader: Training DataLoader with weighted sampling
@@ -116,6 +117,8 @@ def finetune_multi_standard(input_shape, data_loader, val_data_loaders_dict, GPU
         lmbda: Regularization weight for deformation smoothness
         loss_fn: Loss function object (e.g., icon.LNCC(sigma=5))
         dice_loss_weight: Weight for dice loss (typically 0.0 for standard mode)
+        use_wandb: If True, log metrics to Weights & Biases.
+        use_tensorboard: If True, log metrics to TensorBoard.
     """
     from datetime import datetime
     from torch.utils.tensorboard import SummaryWriter
@@ -177,14 +180,17 @@ def finetune_multi_standard(input_shape, data_loader, val_data_loaders_dict, GPU
     
     net_par.train()
     
-    # Setup tensorboard
-    writer = SummaryWriter(
-        footsteps.output_dir + "/logs/" + datetime.now().strftime("%Y%m%d-%H%M%S"),
-        flush_secs=30,
-    )
+    writer = None
+    if use_tensorboard:
+        writer = SummaryWriter(
+            footsteps.output_dir + "/logs/" + datetime.now().strftime("%Y%m%d-%H%M%S"),
+            flush_secs=30,
+        )
     iteration = 0
     
     for epoch in tqdm(range(epochs), desc="Epochs"):
+        if use_wandb:
+            wandb.log({"train/learning_rate": learning_rate}, step=iteration)
         for moving_image, fixed_image in data_loader:
             moving_image, fixed_image = moving_image.cuda(), fixed_image.cuda()
             
@@ -199,7 +205,10 @@ def finetune_multi_standard(input_shape, data_loader, val_data_loaders_dict, GPU
             
             loss_dict = loss_to_dict(loss_object)
             for k, v in loss_dict.items():
-                writer.add_scalar(f"train/{k}", v, iteration)
+                if writer is not None:
+                    writer.add_scalar(f"train/{k}", v, iteration)
+                if use_wandb:
+                    wandb.log({f"train/{k}": v}, step=iteration)
             
             if iteration % 10 == 0:
                 loss_str = f"[Epoch {epoch}, Iter {iteration}] "
@@ -230,7 +239,11 @@ def finetune_multi_standard(input_shape, data_loader, val_data_loaders_dict, GPU
                         val_loss = net_par(val_moving, val_fixed)
                         
                         for k, v in loss_to_dict(val_loss).items():
-                            writer.add_scalar(f"{dataset_name}/val_{k}", v, epoch)
+                            key = f"{dataset_name}/val_{k}"
+                            if writer is not None:
+                                writer.add_scalar(key, v, epoch)
+                            if use_wandb:
+                                wandb.log({key: v}, step=iteration)
                     except Exception as e:
                         print(f"Warning: Validation failed for {dataset_name}: {e}")
             
@@ -241,16 +254,17 @@ def finetune_multi_standard(input_shape, data_loader, val_data_loaders_dict, GPU
         footsteps.output_dir + "checkpoints/Finetune_multi_final.trch",
     )
     print("\nTraining completed!")
-    writer.close()
+    if writer is not None:
+        writer.close()
 
 
 def finetune_multi_segmentation(input_shape, data_loader, val_data_loaders_dict, GPUS, device_ids,
                                 epochs, eval_period, save_period, learning_rate, weights_path,
-                                lmbda=1.5, loss_fn=None, dice_loss_weight=0.0):
+                                lmbda=1.5, loss_fn=None, dice_loss_weight=0.0, use_wandb=True, use_tensorboard=True):
     """
     Finetuning with multiple datasets (segmentation mode).
     Handles datasets that return 4 outputs: (moving_image, fixed_image, moving_seg, fixed_seg).
-    
+
     Args:
         input_shape: Shape of input images
         data_loader: Training DataLoader with weighted sampling
@@ -265,6 +279,8 @@ def finetune_multi_segmentation(input_shape, data_loader, val_data_loaders_dict,
         lmbda: Regularization weight for deformation smoothness
         loss_fn: Loss function object (e.g., icon.LNCC(sigma=5))
         dice_loss_weight: Weight for dice loss (recommended: 0.3-0.5 for segmentation mode)
+        use_wandb: If True, log metrics to Weights & Biases.
+        use_tensorboard: If True, log metrics to TensorBoard.
     """
     if loss_fn is None:
         loss_fn = icon.LNCC(sigma=5)
@@ -323,15 +339,19 @@ def finetune_multi_segmentation(input_shape, data_loader, val_data_loaders_dict,
     
     net_par.train()
     
-    writer = SummaryWriter(
-        footsteps.output_dir + "/logs/" + datetime.now().strftime("%Y%m%d-%H%M%S"),
-        flush_secs=30,
-    )
+    writer = None
+    if use_tensorboard:
+        writer = SummaryWriter(
+            footsteps.output_dir + "/logs/" + datetime.now().strftime("%Y%m%d-%H%M%S"),
+            flush_secs=30,
+        )
     
     print("Starting multi-dataset training (segmentation mode)...")
     iteration = 0
     
     for epoch in tqdm(range(epochs), desc="Epochs"):
+        if use_wandb:
+            wandb.log({"train/learning_rate": learning_rate}, step=iteration)
         for moving_image, fixed_image, moving_seg, fixed_seg in data_loader:
             moving_image = moving_image.cuda()
             fixed_image = fixed_image.cuda()
@@ -346,7 +366,10 @@ def finetune_multi_segmentation(input_shape, data_loader, val_data_loaders_dict,
             
             loss_dict = loss_to_dict(loss_object)
             for k, v in loss_dict.items():
-                writer.add_scalar(f"train/{k}", v, iteration)
+                if writer is not None:
+                    writer.add_scalar(f"train/{k}", v, iteration)
+                if use_wandb:
+                    wandb.log({f"train/{k}": v}, step=iteration)
             
             if iteration % 10 == 0:
                 loss_str = f"[Epoch {epoch}, Iter {iteration}] "
@@ -380,7 +403,11 @@ def finetune_multi_segmentation(input_shape, data_loader, val_data_loaders_dict,
                         val_loss = net_par(val_moving, val_fixed, mask_A=val_moving_seg, mask_B=val_fixed_seg)
                         
                         for k, v in loss_to_dict(val_loss).items():
-                            writer.add_scalar(f"{dataset_name}/val_{k}", v, epoch)
+                            key = f"{dataset_name}/val_{k}"
+                            if writer is not None:
+                                writer.add_scalar(key, v, epoch)
+                            if use_wandb:
+                                wandb.log({key: v}, step=iteration)
                     except Exception as e:
                         print(f"Warning: Validation failed for {dataset_name}: {e}")
             
@@ -390,12 +417,9 @@ def finetune_multi_segmentation(input_shape, data_loader, val_data_loaders_dict,
         net.regis_net.state_dict(),
         footsteps.output_dir + "checkpoints/Finetune_multi_final.trch",
     )
-    torch.save(
-        net.regis_net.state_dict(),
-        footsteps.output_dir + "checkpoints/Finetune_multi_final.trch",
-    )
     print("\nTraining completed!")
-    writer.close()
+    if writer is not None:
+        writer.close()
 
 def main(argv=None):
     import argparse
@@ -413,6 +437,20 @@ def main(argv=None):
     
     footsteps.initialize(run_name=exp_config['name'])
     os.makedirs(footsteps.output_dir + "checkpoints", exist_ok=True)
+    
+    use_wandb = exp_config.get('use_wandb', True)
+    use_tensorboard = exp_config.get('use_tensorboard', True)
+    if use_wandb:
+        wandb_project = exp_config.get('wandb_project', 'unigradicon-finetune')
+        wandb_entity = exp_config.get('wandb_entity', None)
+        wandb_run_name = exp_config.get('wandb_run_name', exp_config['name'])
+        wandb_config = {
+            **{f'experiment_{k}': v for k, v in exp_config.items() if k not in ('use_wandb', 'use_tensorboard', 'wandb_project', 'wandb_entity', 'wandb_run_name')},
+            **{f'training_{k}': v for k, v in train_config.items()},
+            'datasets_count': len(config['datasets']),
+            'datasets_names': [d.get('name', d.get('type', 'unknown')) for d in config['datasets']],
+        }
+        wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_run_name, config=wandb_config)
     
     print(f"\nExperiment: {exp_config['name']}")
     print(f"Mode: {mode}")
@@ -471,7 +509,9 @@ def main(argv=None):
             weights_path=weights_path,
             lmbda=lmbda,
             loss_fn=loss_fn,
-            dice_loss_weight=dice_loss_weight
+            dice_loss_weight=dice_loss_weight,
+            use_wandb=use_wandb,
+            use_tensorboard=use_tensorboard,
         )
     elif mode == 'segmentation':
         print("\nStarting segmentation mode training (with segmentations)...")
@@ -488,10 +528,15 @@ def main(argv=None):
             weights_path=weights_path,
             lmbda=lmbda,
             loss_fn=loss_fn,
-            dice_loss_weight=dice_loss_weight
+            dice_loss_weight=dice_loss_weight,
+            use_wandb=use_wandb,
+            use_tensorboard=use_tensorboard,
         )
     else:
         raise ValueError(f"Unknown mode: {mode}")
+    
+    if use_wandb:
+        wandb.finish()
         
     print("\n" + "=" * 60)
     print("FINETUNING COMPLETED")

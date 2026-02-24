@@ -233,6 +233,58 @@ datasets:
 }
 ```
 
+### 5. Paired CT-US (`paired_ct_us` and `paired_ct_us_seg`)
+
+For **cross-modality pairs** (one CT and one US per subject), use dedicated types so each image gets the correct preprocessing (CT: HU window; US: quantile/min-max). The repo’s usual CT/MRI setup uses **separate datasets** (e.g. one unpaired MRI, one unpaired CT); there is no built-in “one CT + one MRI in the same pair.” For CT–US pairs, use:
+
+- **`paired_ct_us`**: returns `(moving_image, fixed_image)` with moving=US, fixed=CT (standard training loop).
+- **`paired_ct_us_seg`**: returns `(moving_image, fixed_image, moving_seg, fixed_seg)` for Dice loss (segmentation training loop).
+
+**JSON format:** One `subject_id` per physical pair, two entries per pair (one CT, one US). Only include pairs where both CT and US exist. Each entry must have `"modality": "ct"` or `"us"`. For `paired_ct_us_seg`, every entry must also have a `"segmentation"` path.
+
+```json
+{
+  "data": [
+    {"image": "path/to/200L_imgCT.nii.gz", "segmentation": "path/to/200L_segCT.nii.gz", "subject_id": "200_L", "modality": "ct"},
+    {"image": "path/to/200L_imgUS.nii.gz", "segmentation": "path/to/200L_segUS.nii.gz", "subject_id": "200_L", "modality": "us"}
+  ]
+}
+```
+
+**Build the JSON from TRUSTED-style directories:** Use the provided script to scan CT/US dirs, match by (patient_id, side), and write the JSON (with optional segmentation paths when files exist):
+
+```bash
+python -m unigradicon.finetuning.scripts.build_trusted_pairs_json \
+  --data_path /path/to/trusted_code_nsd \
+  --output configs/trusted_pairs.json
+```
+
+Optional: `--ct_dir`, `--us_dir`, `--seg_suffix_ct`, `--seg_suffix_us`. For **paired_ct_us_seg**, every pair must have segmentation files. **If segmentations are in separate folders** (e.g. `CT_masks/`, `US_masks/` with files like `200R_seg.nii.gz` and `200R_maskUS.nii.gz`), the script auto-detects `{data_path}/CT_masks` and `{data_path}/US_masks` when present, and uses `--ct_seg_basename_suffix _seg` and `--us_seg_basename_suffix _maskUS` by default. Override with `--ct_seg_dir`, `--us_seg_dir`, `--ct_seg_basename_suffix`, `--us_seg_basename_suffix` if your layout or naming differs. If segs sit next to images, use `--seg_suffix_ct` / `--seg_suffix_us` (e.g. `200R_segCT.nii.gz`). Add `--require_segmentation` to fail if any pair is missing segmentations. See script docstring for details.
+
+**Example config (paired CT-US with segmentation):**
+
+```yaml
+datasets:
+  - name: "trusted_ct_us_seg"
+    type: "paired_ct_us_seg"
+    weight: 1.0
+    json_file: "trusted_pairs.json"
+    ct_window: [-1000, 1000]
+    quantile_range: [0.0, 1.0]
+```
+
+Use `type: "paired_ct_us"` (and the standard training loop, no `dice_loss_weight`) when you do not have segmentations.
+
+**Optional: pre-computed affine transforms**
+
+You can resample one modality into the other’s space before training (e.g. US into CT space so the network sees roughly aligned pairs). Add these optional keys under the dataset entry:
+
+- **`affine_transforms_dir`**: Directory containing `.tfm` files (e.g. `rigid_masks_transforms/`). Path is relative to the config file’s directory if not absolute. Omit or leave null to disable.
+- **`affine_direction`**: `"us_to_ct"` (resample US into CT space; moving = US in CT space, fixed = CT) or `"ct_to_us"` (resample CT into US space; moving = US, fixed = CT in US space). Default: `"us_to_ct"`.
+- **`affine_type`**: Suffix used in transform filenames (e.g. `"rigid_mask"`). Default: `"rigid_mask"`.
+
+Transform filenames must match `subject_id` and direction: e.g. `200_R_US_to_CT_rigid_mask.tfm` for `us_to_ct` and `affine_type=rigid_mask`, or `200_R_CT_to_US_rigid_mask.tfm` for `ct_to_us`. When using `paired_ct_us_seg`, each image’s segmentation is resampled with the same transform and reference grid when that image is resampled, so segmentations stay aligned with the images.
+
 ## Advanced Features
 
 ### Multi-Dataset Training
@@ -312,6 +364,8 @@ datasets:
 
 ### CT vs MRI Preprocessing
 
+In multi-dataset configs, CT and MRI are used as **separate datasets** (e.g. one unpaired MRI dataset and one unpaired CT dataset). Each batch is then either two MRI or two CT images—there is no “one CT + one MRI in the same pair” in the standard types. For **CT–US paired data**, use the dedicated types `paired_ct_us` or `paired_ct_us_seg` (see [Paired CT-US](#5-paired-ct-us-paired_ct_us-and-paired_ct_us_seg)).
+
 **MRI (default):**
 ```yaml
 datasets:
@@ -345,3 +399,6 @@ datasets:
 - Set `use_cache: false`
 - Delete old caches: `rm -rf results/*_cache`
 - Use `maximum_images` to limit dataset size
+
+### Transforms / augmentation
+- Data augmentation (e.g. spatial transforms) is not included in this finetuning setup. A future option may add an optional `transforms` or `augmentation` section in the training YAML; if so, the same transform would be applied to both moving and fixed (and to segmentations when using segmentation types) to preserve spatial correspondence.
