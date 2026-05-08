@@ -1,64 +1,152 @@
 # Finetuning uniGradICON on Your Data
 
-This guide shows you how to finetune uniGradICON on your own datasets using configuration files. The finetuning system supports multiple datasets, weighted sampling, and segmentation-based training.
+This guide shows you how to finetune uniGradICON on your own datasets using configuration files. The finetuning system supports multiple datasets, weighted sampling, and segmentation/mask-based training.
 
-## 📋 Table of Contents
-- [Quick Start](#-quick-start)
-- [Step-by-Step Guide](#-step-by-step-guide)
-- [Configuration Guide](#-configuration-guide)
-- [Dataset Types](#-dataset-types)
-- [Advanced Features](#-advanced-features)
-- [Dice Loss and Masking](#-dice-loss-and-masking)
+## Table of Contents
+- [Quick Start](#quick-start)
+- [Example: Finetuning on Learn2Reg Data](#example-finetuning-on-learn2reg-data)
+- [Step-by-Step Guide](#step-by-step-guide)
+- [Configuration Guide](#configuration-guide)
+- [Dataset Types](#dataset-types)
+- [JSON Data Fields](#json-data-fields)
+- [Segmentation, Masking, and Dice Loss](#segmentation-masking-and-dice-loss)
+- [Label Randomization](#label-randomization-use_label)
+- [Advanced Features](#advanced-features)
+- [Troubleshooting](#troubleshooting)
 
-## 🚀 Quick Start
+## Quick Start
 
-**Install (PyPI or source):**
+**Recommended:** CUDA-capable GPU. CPU technically works but is too slow for any real training run.
+
+**Install from PyPI or source:**
 - PyPI: `pip install unigradicon`
-- Dev/source: `pip install -e .` from the repo root
+- Development/source: `pip install -e .` from the repo root
 
 ```bash
 # Run with your config
 unigradicon-finetune --config /path/to/your_config.yaml
 
-# Example config path (in repo checkout)
-python -m unigradicon.finetuning.finetune --config src/unigradicon/finetuning/configs/config.yaml
+# Example with repo checkout (after pip install -e .)
+unigradicon-finetune --config configs/examples/config.yaml
+```
+
+## Example: Finetuning on Learn2Reg Data
+
+This section walks through finetuning uniGradICON on three public [Learn2Reg](https://learn2reg.grand-challenge.org/) datasets. Ready-to-use configs are provided for each dataset individually and for multi-dataset training.
+
+| Config | Dataset | Type | Modality | Similarity | Pretrained | Images |
+|--------|---------|------|----------|------------|------------|--------|
+| `l2r_oasis.yaml` | OASIS brain MRI | `unpaired` | MRI | lncc | uniGradICON | 414 |
+| `l2r_lungct.yaml` | LungCT | `paired` | CT | lncc | uniGradICON | 40 (20 x 2) |
+| `l2r_abdomenmrct.yaml` | AbdomenMRCT | `unpaired` | CT + MR | lncc2 | multiGradICON | 105 (48 CT + 57 MR) |
+| `l2r_multi.yaml` | All three combined | mixed | MRI + CT | lncc2 | multiGradICON | 559 |
+
+Cross-modality datasets (AbdomenMRCT) use per-image `"modality"` fields in the JSON so each image is preprocessed according to its own modality (CT windowing vs MRI quantile normalization). `lncc2` (SquaredLNCC) is used as a modality-invariant similarity measure, and `multigradicon` provides pretrained weights for multimodal registration.
+
+### 1. Install uniGradICON
+
+See [Quick Start](#quick-start).
+
+### 2. Download the datasets
+
+Download the **training splits** from the [Learn2Reg Datasets page](https://learn2reg.grand-challenge.org/Datasets/) (requires a free Grand Challenge account):
+
+- **OASIS**: brain MRI with 35 anatomical structure labels
+- **LungCT**: paired inspiration/expiration lung CT with lung masks
+- **AbdomenMRCT**: abdomen CT/MR with organ labels (cross-modality)
+
+### 3. Extract into a `datasets/` directory
+
+```bash
+mkdir -p datasets
+# Move downloaded zip files into datasets/ then extract:
+cd datasets
+unzip OASIS.zip
+unzip LungCT.zip
+unzip AbdomenMRCT.zip
+cd ..
+```
+
+Your directory should look like:
+```
+datasets/
+├── OASIS/
+│   ├── imagesTr/       # 414 brain MRI scans
+│   └── labelsTr/       # 35-structure segmentation labels
+├── LungCT/
+│   ├── imagesTr/       # 40 lung CT scans (20 subjects x 2 timepoints)
+│   └── masksTr/        # lung masks
+└── AbdomenMRCT/
+    ├── imagesTr/       # 105 images (48 CT + 57 MR, cross-modality)
+    └── labelsTr/       # organ labels
+```
+
+### 4. Generate JSON dataset files
+
+```bash
+python scripts/prepare_l2r_datasets.py --data_dir datasets/
+```
+
+This scans the extracted data and creates JSON files (`l2r_oasis.json`, `l2r_lungct.json`, `l2r_abdomenmrct.json`) in `configs/learn2reg/`. You only need to run this once.
+
+### 5. Start finetuning
+
+Pick any of the provided configs:
+
+```bash
+# Brain MRI (unpaired, 414 images)
+unigradicon-finetune --config configs/learn2reg/l2r_oasis.yaml
+
+# Lung CT (paired, 20 subjects x 2 time points)
+unigradicon-finetune --config configs/learn2reg/l2r_lungct.yaml
+
+# Abdomen MRCT (105 CT+MR images with per-image modality, lncc2 + multiGradICON)
+unigradicon-finetune --config configs/learn2reg/l2r_abdomenmrct.yaml
+
+# Multi-dataset (all three, weighted sampling)
+unigradicon-finetune --config configs/learn2reg/l2r_multi.yaml
+```
+
+### 6. Monitor and use results
+
+```bash
+# Monitor training
+tensorboard --logdir results/
+
+# Use finetuned weights for inference
+unigradicon-register \
+  --fixed fixed.nii.gz --moving moving.nii.gz \
+  --fixed_modality mri --moving_modality mri \
+  --quantile_range 0.0 0.99 \
+  --transform_out transform.hdf5 \
+  --network_weights results/l2r_oasis_brain_mri/checkpoints/network_weights_final.trch
 ```
 
 ## Step-by-Step Guide
 
 ### Step 1: Prepare Your Data
 
-Organize your data and create a JSON file to define your datasets. All datasets use a consistent JSON format with a `data` list.
+Organize your NIfTI data and create a JSON file. The JSON format uses a `data` list where each entry has an `image` path and optional fields for segmentations and masks:
 
-**Example `dataset.json` for unpaired data:**
 ```json
 {
   "data": [
-    {"image": "/path/to/img1.nii.gz"},
-    {"image": "/path/to/img2.nii.gz"}
+    {"image": "img1.nii.gz"},
+    {"image": "img2.nii.gz"}
   ]
 }
 ```
 
-**Example `dataset.json` for paired data:**
-```json
-{
-  "data": [
-    {"image": "/path/p1_t0.nii.gz", "subject_id": "p1"},
-    {"image": "/path/p1_t1.nii.gz", "subject_id": "p1"}
-  ]
-}
-```
+All datasets require at least 2 images. Paired datasets need at least 2 images per subject. Image, segmentation, and mask paths should point to NIfTI/ITK-readable image files. Paths can be absolute or relative to the JSON file's directory. See [JSON Data Fields](#json-data-fields) for all supported fields.
 
 ### Step 2: Create a Configuration File
 
-Create a YAML file (e.g., `my_config.yaml`) in the `configs/` directory:
+Create a YAML file (e.g., `my_config.yaml`):
 
 ```yaml
 experiment:
   name: "my_finetuning_experiment"
-  model: "unigradicon"  # or "multigradicon"
-  weights_path: "unigradicon"  # Auto-downloads if not found
+  model_weights: "unigradicon"  # Auto-downloads if not found
 
 training:
   batch_size: 4
@@ -66,26 +154,25 @@ training:
   epochs: 100
   eval_period: 10  # Validate every N epochs
   save_period: 50  # Save checkpoint every N epochs
-  learning_rate: 0.00005
-  input_shape: [175, 175, 175]  # Target image size
-  
+  learning_rate: 0.00005  # Original pretraining LR
+  input_shape: [175, 175, 175]  # Model input size (images are resampled to this)
+  seed: 42  # Optional: for reproducibility
+
   # Loss configuration
   lambda: 1.5  # Regularization weight
   similarity: "lncc"  # Options: "lncc", "lncc2", "mind"
   lncc_sigma: 5  # For LNCC losses
-  dice_loss_weight: 0.0  # >0 only for segmentation datasets
-  loss_function_masking: false  # When true, Dice is disabled and must stay 0.0
 
 datasets:
   - name: "my_dataset"
     weight: 1.0  # Relative sampling weight (any positive value)
-    type: "unpaired"  # See Dataset Types below
+    type: "unpaired"  # "unpaired" or "paired"
     json_file: "my_dataset.json"
-    maximum_images: null  # Optional: limit number of images
-    shuffle: true
     is_ct: false  # Set to true for CT images
-    quantile_range: [0.01, 0.99]  # For MRI normalization
+    quantile_range: [0.0, 0.99]  # For MRI normalization
 ```
+
+Values shown above are examples; see [Training Parameters](#training-parameters) for defaults.
 
 ### Step 3: Start Training
 
@@ -96,12 +183,12 @@ unigradicon-finetune --config configs/my_config.yaml
 ### Step 4: Monitor Training
 
 Training progress is logged to TensorBoard. Validation writes scalar losses plus image panels
-(moving/fixed/warped/difference), and segmentation panels when segmentation datasets are used:
+(moving/fixed/warped/difference), segmentation overlay panels when segmentation data is available,
+and mask overlay panels when mask data is available:
 
 ```bash
 # Footsteps stores runs in results/<experiment.name>/logs/<timestamp>
-tensorboard --logdir="results/my_finetuning_experiment/logs"
-# If you rerun with the same name, use the suffixed folder (e.g., results/my_finetuning_experiment-1/logs)
+tensorboard --logdir results/
 ```
 
 ### Step 5: Use Your Finetuned Model
@@ -116,12 +203,29 @@ ls results/my_finetuning_experiment/checkpoints/
 unigradicon-register \
   --fixed fixed.nii.gz \
   --moving moving.nii.gz \
+  --fixed_modality mri --moving_modality mri \
   --transform_out transform.hdf5 \
   --warped_moving_out warped.nii.gz \
-  --network_weights results/my_finetuning_experiment/checkpoints/network_weights_100
+  --network_weights results/my_finetuning_experiment/checkpoints/network_weights_final.trch
 ```
 
-## ⚙️ Configuration Guide
+### Matching Preprocessing Between Finetuning and Inference
+
+The default preprocessing parameters match between finetuning and inference, so no extra flags are needed if you use the defaults. If you customize `quantile_range` or `ct_window` in your finetuning config, pass the same values at inference time.
+
+**Note:** The finetuning `modality` field accepts any string (e.g., `"t1"`, `"flair"`); any value matching `"ct"` (case-insensitive) triggers CT preprocessing, all others use MRI. The CLI `--fixed_modality` / `--moving_modality` flags accept `"ct"` or `"mri"` only. Use `--fixed_modality mri` for any non-CT modality at inference.
+
+```bash
+# Example: custom ct_window used during finetuning
+unigradicon-register \
+  --fixed fixed.nii.gz --moving moving.nii.gz \
+  --fixed_modality ct --moving_modality ct \
+  --ct_window -500 1500 \
+  --transform_out transform.hdf5 \
+  --network_weights results/my_experiment/checkpoints/network_weights_final.trch
+```
+
+## Configuration Guide
 
 ### Training Parameters
 
@@ -131,14 +235,21 @@ unigradicon-register \
 | `gpus` | list | GPU device IDs | [0] |
 | `epochs` | int | Training epochs | 500 |
 | `learning_rate` | float | Adam learning rate | 5e-5 |
-| `input_shape` | list | Target image dimensions [D,H,W] used during finetuning | [175,175,175] |
-| `eval_period` | int | Validate every N epochs | 15 |
+| `input_shape` | list | Model input dimensions [D, H, W] (images are resampled to this) | [175, 175, 175] |
+| `eval_period` | int | Validate every N epochs | 10 |
 | `save_period` | int | Save checkpoint every N epochs | 50 |
+| `seed` | int | Random seed for reproducibility | null |
 | `lambda` | float | Regularization weight | 1.5 |
 | `similarity` | str | Loss function: "lncc", "lncc2", "mind" | "lncc" |
-| `dice_loss_weight` | float | Dice loss term weight for segmentation mode | 0.0 |
-| `loss_function_masking` | bool | Apply segmentation mask to similarity loss (segmentation mode only) | false |
-| `samples_per_epoch` | int | Samples per epoch (optional) | null |
+| `dice_loss_weight` | float | Dice loss weight (requires `segmentation` in JSON) | 0.0 |
+| `loss_function_masking` | bool | Restrict similarity loss to masked regions (requires `mask` in JSON) | false |
+| `roi_masking` | bool | Crop images to ROI before registration (requires `mask` in JSON) | false |
+| `use_label` | bool | Label randomization for modality-invariant training (see below) | false |
+| `lncc_sigma` | int | Sigma for LNCC / SquaredLNCC similarity | 5 |
+| `mind_radius` | int | Radius for MIND-SSC similarity | 2 |
+| `mind_dilation` | int | Dilation for MIND-SSC similarity | 2 |
+| `samples_per_epoch` | int | Number of samples drawn per epoch (with replacement); null defaults to the combined dataset size | null |
+| `num_workers` | int | DataLoader worker processes | 4 |
 
 ### Input Shape Guidance
 
@@ -149,22 +260,30 @@ unigradicon-register \
 
 ### Dataset Parameters
 
-| Parameter | Type | Description | Required |
-|-----------|------|-------------|----------|
-| `name` | str | Dataset identifier | ✓ |
-| `weight` | float | Sampling weight | ✓ |
-| `type` | str | Dataset type (see below) | ✓ |
-| `json_file` | str | Path to JSON dataset definition | ✓ |
-| `maximum_images` | int | Limit number of images | Optional |
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `name` | str | Dataset identifier | Required |
+| `type` | str | `"unpaired"` or `"paired"` | Required |
+| `json_file` | str | Path to JSON dataset definition | Required |
+| `weight` | float | Relative sampling weight | 1.0 |
+| `maximum_images` | int | Limit number of images | null |
 | `use_cache` | bool | Enable/disable caching | true |
-| `is_ct` | bool | CT vs MRI preprocessing | false |
+| `use_compression` | bool | Compress images in RAM and on disk with blosc (see [In-Memory Compression](#in-memory-compression)) | false |
+| `cache_dir` | str | Directory for cached datasets | null |
+| `shuffle` | bool | Shuffle image order before loading | true |
+| `is_ct` | bool | CT or MRI preprocessing | false |
+| `ct_window` | list | HU window for CT [min, max] | [-1000, 1000] |
+| `quantile_range` | list | Intensity quantile range for MRI | [0.0, 0.99] |
 
 `json_file` paths are resolved relative to the YAML config file's directory, so you can usually reference just the filename.
+Images, segmentations, and masks should be NIfTI files readable by ITK.
 
 ## Dataset Types
 
-### 1. Unpaired Dataset (`unpaired`)
-Random pairs of images from different subjects.
+There are two dataset types, which control how image pairs are formed:
+
+### Unpaired (`unpaired`)
+Random pairs of images from the dataset.
 
 ```yaml
 datasets:
@@ -174,18 +293,8 @@ datasets:
     weight: 1.0
 ```
 
-**JSON Format:**
-```json
-{
-  "data": [
-    {"image": "/path/to/img1.nii.gz"},
-    {"image": "/path/to/img2.nii.gz"}
-  ]
-}
-```
-
-### 2. Paired Dataset (`paired`)
-Matched pairs of images from the same subject.
+### Paired (`paired`)
+Matched pairs of images from the same subject (requires `subject_id` in JSON entries).
 
 ```yaml
 datasets:
@@ -195,108 +304,156 @@ datasets:
     weight: 1.0
 ```
 
-**JSON Format:**
+## JSON Data Fields
+
+Each JSON dataset file has a `data` list where each entry contains an `image` path and optional fields. The training configuration determines which optional fields are required:
+
+- `dice_loss_weight > 0` requires `segmentation`
+- `loss_function_masking: true` or `roi_masking: true` requires `mask`
+
+Fields that are present in JSON but not required by the current training configuration are ignored.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `image` | Yes | Path to the image file |
+| `segmentation` | No | Path to integer label map for Dice loss |
+| `mask` | No | Path to binary ROI mask for loss masking / image cropping |
+| `subject_id` | No | Subject identifier (required for `paired` type) |
+| `modality` | No | Per-image modality (e.g., `"ct"`, `"t1"`, `"t2"`, `"flair"`). Any value matching `"ct"` (case-insensitive) uses CT preprocessing; all other values use MRI. Also used for label randomization grouping. |
+
+**Consistency rule:** Every dataset entry in every dataset must provide the optional fields required by the training configuration so the loss function composition is consistent across all batches.
+
+If required fields are missing, config validation fails before training starts with a clear error listing the dataset and entry index.
+
+### Example: images only
+```json
+{"data": [{"image": "img1.nii.gz"}, {"image": "img2.nii.gz"}]}
+```
+
+### Example: with segmentations (for Dice loss)
 ```json
 {
   "data": [
-    {"image": "/path/p1_t0.nii.gz", "subject_id": "p1"},
-    {"image": "/path/p1_t1.nii.gz", "subject_id": "p1"}
+    {"image": "img1.nii.gz", "segmentation": "seg1.nii.gz"},
+    {"image": "img2.nii.gz", "segmentation": "seg2.nii.gz"}
   ]
 }
 ```
 
-### 3. Unpaired with Segmentation (`unpaired_with_seg`)
-Random pairs with segmentation guidance using Dice loss.
+### Example: with masks (for ROI masking)
+```json
+{
+  "data": [
+    {"image": "img1.nii.gz", "mask": "mask1.nii.gz"},
+    {"image": "img2.nii.gz", "mask": "mask2.nii.gz"}
+  ]
+}
+```
+
+### Example: with both segmentations and masks
+```json
+{
+  "data": [
+    {"image": "img1.nii.gz", "segmentation": "seg1.nii.gz", "mask": "mask1.nii.gz"},
+    {"image": "img2.nii.gz", "segmentation": "seg2.nii.gz", "mask": "mask2.nii.gz"}
+  ]
+}
+```
+
+## Segmentation, Masking, and Dice Loss
+
+The forward pass accepts three types of auxiliary data, each serving a distinct purpose:
+
+| Parameter | Data source | Purpose |
+|-----------|------------|---------|
+| `segmentation_A/B` | `segmentation` field in JSON | Integer label maps for Dice loss computation |
+| `mask_A/B` | `mask` field in JSON | Binary ROI masks passed to similarity function |
+| `label_A/B` | Auto-selected from same-subject images via `subject_id` + `modality` | Alternative similarity input for modality-invariant training (`use_label`) |
+
+### Dice Loss
+
+When `dice_loss_weight > 0`, the Dice loss is computed between warped and target segmentations. Only classes present in both segmentations contribute to the loss (background is excluded).
 
 ```yaml
-datasets:
-  - name: "brain_structures"
-    type: "unpaired_with_seg"
-    json_file: "brain_seg.json"
-    weight: 1.0
+training:
+  dice_loss_weight: 0.5  # Requires 'segmentation' in JSON
 ```
 
-**JSON Format:**
-```json
-{
-  "data": [
-    {"image": "/path/img1.nii.gz", "segmentation": "/path/seg1.nii.gz"}
-  ]
-}
-```
+Total loss: `L_total = lambda * L_inverse_consistency + L_similarity + dice_loss_weight * L_dice`
 
-### 4. Paired with Segmentation (`paired_with_seg`)
-Paired images with segmentation guidance.
+### Loss Function Masking
+
+When `loss_function_masking: true`, binary masks restrict where the similarity loss is computed. This focuses registration on regions of interest.
 
 ```yaml
-datasets:
-  - name: "cardiac_phases"
-    type: "paired_with_seg"
-    json_file: "cardiac.json"
-    weight: 1.0
+training:
+  loss_function_masking: true  # Requires 'mask' in JSON
 ```
 
-**JSON Format:**
-```json
-{
-  "data": [
-    {"image": "/path/p1_t0.nii.gz", "segmentation": "/path/p1_t0_seg.nii.gz", "subject_id": "p1"},
-    {"image": "/path/p1_t1.nii.gz", "segmentation": "/path/p1_t1_seg.nii.gz", "subject_id": "p1"}
-  ]
-}
-```
+### ROI Masking (Image Cropping)
 
-### 5. Paired CT-US (`paired_ct_us` and `paired_ct_us_seg`)
-
-For **cross-modality pairs** (one CT and one US per subject), use dedicated types so each image gets the correct preprocessing (CT: HU window; US: quantile/min-max). The repo’s usual CT/MRI setup uses **separate datasets** (e.g. one unpaired MRI, one unpaired CT); there is no built-in “one CT + one MRI in the same pair.” For CT–US pairs, use:
-
-- **`paired_ct_us`**: returns `(moving_image, fixed_image)` with moving=US, fixed=CT (standard training loop).
-- **`paired_ct_us_seg`**: returns `(moving_image, fixed_image, moving_seg, fixed_seg)` for Dice loss (segmentation training loop).
-
-**JSON format:** One `subject_id` per physical pair, two entries per pair (one CT, one US). Only include pairs where both CT and US exist. Each entry must have `"modality": "ct"` or `"us"`. For `paired_ct_us_seg`, every entry must also have a `"segmentation"` path.
-
-```json
-{
-  "data": [
-    {"image": "path/to/200L_imgCT.nii.gz", "segmentation": "path/to/200L_segCT.nii.gz", "subject_id": "200_L", "modality": "ct"},
-    {"image": "path/to/200L_imgUS.nii.gz", "segmentation": "path/to/200L_segUS.nii.gz", "subject_id": "200_L", "modality": "us"}
-  ]
-}
-```
-
-**Build the JSON from TRUSTED-style directories:** Use the provided script to scan CT/US dirs, match by (patient_id, side), and write the JSON (with optional segmentation paths when files exist):
-
-```bash
-python -m unigradicon.finetuning.scripts.build_trusted_pairs_json \
-  --data_path /path/to/trusted_code_nsd \
-  --output configs/trusted_pairs.json
-```
-
-Optional: `--ct_dir`, `--us_dir`, `--seg_suffix_ct`, `--seg_suffix_us`. For **paired_ct_us_seg**, every pair must have segmentation files. **If segmentations are in separate folders** (e.g. `CT_masks/`, `US_masks/` with files like `200R_seg.nii.gz` and `200R_maskUS.nii.gz`), the script auto-detects `{data_path}/CT_masks` and `{data_path}/US_masks` when present, and uses `--ct_seg_basename_suffix _seg` and `--us_seg_basename_suffix _maskUS` by default. Override with `--ct_seg_dir`, `--us_seg_dir`, `--ct_seg_basename_suffix`, `--us_seg_basename_suffix` if your layout or naming differs. If segs sit next to images, use `--seg_suffix_ct` / `--seg_suffix_us` (e.g. `200R_segCT.nii.gz`). Add `--require_segmentation` to fail if any pair is missing segmentations. See script docstring for details.
-
-**Example config (paired CT-US with segmentation):**
+When `roi_masking: true`, images are multiplied by the binary mask after augmentation, zeroing out background regions before they enter the network.
 
 ```yaml
-datasets:
-  - name: "trusted_ct_us_seg"
-    type: "paired_ct_us_seg"
-    weight: 1.0
-    json_file: "trusted_pairs.json"
-    ct_window: [-1000, 1000]
-    quantile_range: [0.0, 1.0]
+training:
+  roi_masking: true  # Requires 'mask' in JSON
 ```
 
-Use `type: "paired_ct_us"` (and the standard training loop, no `dice_loss_weight`) when you do not have segmentations.
+### Combining Features
 
-**Optional: pre-computed affine transforms**
+Dice loss and masking use separate data fields, so they can be combined freely:
 
-You can resample one modality into the other’s space before training (e.g. US into CT space so the network sees roughly aligned pairs). Add these optional keys under the dataset entry:
+```yaml
+training:
+  dice_loss_weight: 0.5       # Uses 'segmentation' field
+  loss_function_masking: true  # Uses 'mask' field
+  roi_masking: true            # Uses 'mask' field
+```
 
-- **`affine_transforms_dir`**: Directory containing `.tfm` files (e.g. `rigid_masks_transforms/`). Path is relative to the config file’s directory if not absolute. Omit or leave null to disable.
-- **`affine_direction`**: `"us_to_ct"` (resample US into CT space; moving = US in CT space, fixed = CT) or `"ct_to_us"` (resample CT into US space; moving = US, fixed = CT in US space). Default: `"us_to_ct"`.
-- **`affine_type`**: Suffix used in transform filenames (e.g. `"rigid_mask"`). Default: `"rigid_mask"`.
+This requires both `segmentation` and `mask` fields in the JSON data.
 
-Transform filenames must match `subject_id` and direction: e.g. `200_R_US_to_CT_rigid_mask.tfm` for `us_to_ct` and `affine_type=rigid_mask`, or `200_R_CT_to_US_rigid_mask.tfm` for `ct_to_us`. When using `paired_ct_us_seg`, each image’s segmentation is resampled with the same transform and reference grid when that image is resampled, so segmentations stay aligned with the images.
+### Label Randomization (`use_label`)
+
+This reproduces the multiGradICON training strategy where the similarity loss is computed
+on a randomly chosen modality image instead of the registration input image. This forces
+the network to learn modality-invariant features.
+
+```yaml
+training:
+  use_label: true
+```
+
+**How it works:** For each pair, the dataset picks a random modality that both subjects
+have in common and uses those images as the similarity input. The network still registers
+the original images, but the loss is evaluated on the randomly chosen modality.
+
+**When to use:** This is designed for multi-sequence MRI datasets (e.g., T1, T2, FLAIR
+from the same scanning session) where all sequences are co-registered. It is generally
+not appropriate for CT + MRI combinations, which come from different scanners and may
+not share the same coordinate space.
+
+**JSON format:** Use `subject_id` to group co-registered images per subject. The `modality`
+field identifies the sequence. Labels are always sampled from the same modality across
+both subjects in a pair:
+
+```json
+{
+  "data": [
+    {"image": "sub01_t1.nii.gz", "subject_id": "sub01", "modality": "t1"},
+    {"image": "sub01_t2.nii.gz", "subject_id": "sub01", "modality": "t2"},
+    {"image": "sub01_flair.nii.gz", "subject_id": "sub01", "modality": "flair"},
+    {"image": "sub02_t1.nii.gz", "subject_id": "sub02", "modality": "t1"},
+    {"image": "sub02_t2.nii.gz", "subject_id": "sub02", "modality": "t2"}
+  ]
+}
+```
+
+For preprocessing, `"ct"` triggers CT windowing; all other modality values use MRI
+quantile normalization.
+
+If no `subject_id` is present, `use_label` is a no-op. Labels are identical to images.
+For subjects with multiple scans of the same modality (e.g., longitudinal data), the label
+is a randomly chosen scan from the same subject, which can still provide useful regularization.
 
 ## Advanced Features
 
@@ -310,12 +467,12 @@ datasets:
     weight: 0.4
     type: "unpaired"
     json_file: "brain_t1.json"
-  
+
   - name: "brain_t2"
     weight: 0.3
     type: "unpaired"
     json_file: "brain_t2.json"
-  
+
   - name: "lung_ct"
     weight: 0.3
     type: "unpaired"
@@ -326,49 +483,50 @@ datasets:
 
 **Note:** Weights are relative; they do not need to sum to 1.0.
 
-## 🎯 Dice Loss and Masking
-
-When training with segmentation datasets (`unpaired_with_seg` or `paired_with_seg`), the total loss is:
-
-`L_total = lambda * L_inverse_consistency + L_similarity + dice_loss_weight * L_dice`
-
-- `dice_loss_weight` controls how strongly segmentation overlap is optimized.
-- Set `dice_loss_weight: 0.0` to disable Dice.
-
-### Important masking rule
-
-If you enable:
-
-```yaml
-training:
-  loss_function_masking: true
-```
-
-then Dice loss is not calculated in finetuning. In this mode, `dice_loss_weight` must be `0.0`.
-
 ### Auto-Download Pretrained Weights
 
 Specify model name instead of path to auto-download:
 
 ```yaml
 experiment:
-  weights_path: "unigradicon"      # Auto-downloads uniGradICON weights
+  model_weights: "unigradicon"      # Auto-downloads uniGradICON weights
   # OR
-  weights_path: "multigradicon"    # Auto-downloads multiGradICON weights
+  model_weights: "multigradicon"    # Auto-downloads multiGradICON weights
   # OR
-  weights_path: "/path/to/my/weights.trch"  # Use custom weights
+  model_weights: "/path/to/my/weights.trch"  # Use custom weights
 ```
 
-### Resume Training
+### Warm-Start From a Checkpoint
 
-The system automatically detects if you're resuming from a checkpoint:
+Pointing `model_weights` at a saved network checkpoint loads the network state at the start of the run:
 
 ```yaml
 experiment:
-  weights_path: "results/my_experiment/checkpoints/network_weights_50"
+  model_weights: "results/my_experiment/checkpoints/network_weights_50.trch"
 ```
 
-If `optimizer_weights_50` exists, training resumes with optimizer state. Otherwise, it starts fresh with the model weights.
+If a sibling `optimizer_weights_50.trch` exists in the same directory, the optimizer state is loaded too; otherwise the optimizer initializes from scratch.
+
+This is a **warm start**, not a true resume:
+
+- Epoch and iteration counters restart from 0.
+- TensorBoard logs go to a new run directory (no continuation of curves).
+- Set `epochs` to the *additional* number of epochs you want to train, not the original target epoch.
+
+Example: to train 50 more epochs after `network_weights_50.trch`, set `epochs: 50` (not `100`).
+
+### Reproducibility (`seed`)
+
+```yaml
+training:
+  seed: 42
+```
+
+Seeds Python `random`, NumPy, and PyTorch (CPU and GPU) at startup, and seeds each DataLoader worker. With the same seed, the sampler index sequence is reproducible across runs and the `maximum_images` subset is stable (paths are sorted first, then the first `maximum_images` entries are taken before optional shuffling).
+
+The seed does **not** guarantee identical batches end-to-end. Augmentation and image-pair sampling use Python `random`, which is shared between the train and validation loops in the parent process and forked into each DataLoader worker. With `num_workers > 0` the order in which workers return batches depends on OS scheduling, so per-batch contents will vary even when each worker is individually deterministic.
+
+**Not bit-exact on GPU.** Some CUDA ops are non-deterministic by default, so loss values still drift slightly run-to-run. For exact reproducibility, set `cudnn.deterministic=True`, `cudnn.benchmark=False`, and `torch.use_deterministic_algorithms(True)` in your own entry point; expect a runtime cost.
 
 ### Control Samples Per Epoch
 
@@ -376,10 +534,10 @@ For large datasets or faster testing:
 
 ```yaml
 training:
-  samples_per_epoch: 4000  # Process 4000 samples per epoch
+  samples_per_epoch: 4000  # Draw 4000 samples per epoch
 ```
 
-Without this parameter, all dataset samples are used each epoch.
+Sampling is with replacement: setting a value larger than the combined dataset size draws more samples per epoch (some entries seen multiple times); a smaller value draws fewer (some entries skipped). When unset, defaults to the combined dataset size.
 
 ### Disable Caching
 
@@ -393,7 +551,25 @@ datasets:
     use_cache: false  # Reload images every time
 ```
 
-**Default:** Caching is enabled. Cached data is stored in `results/[dataset_name]_cache/`.
+**Default:** Caching is enabled. Cached data is stored under `<cache_dir>/<signature>/` (or `<results/experiment>/<signature>/` if `cache_dir` is unset). The signature is a hash of every parameter that can change the cached tensors: `dataset_name`, `input_shape`, `is_ct`, `ct_window`, `quantile_range`, per-image `modality` map, `maximum_images`, `use_compression`, and a fingerprint of the JSON entries. Changing any of these (including editing the JSON entry list) yields a new signature and a fresh cache build. Each signature directory contains one `.trch` file per cache kind (`<dataset>_cached_images.trch`, plus `_segmentations.trch` / `_masks.trch` when those are required) and a `_meta.json` sidecar describing the parameters behind the hash.
+
+**Concurrent jobs with a shared `cache_dir`:** caching is intended for serial use. Running multiple finetune jobs in parallel that point at the same `cache_dir` is not a supported workflow. Concurrent writers can race on the cache file and a reader may observe a partial write. If you need to run multiple jobs at once:
+
+- give each job its own `cache_dir` (e.g. `cache_dir: /path/cache_jobA`, `cache_dir: /path/cache_jobB`), or
+- pre-build the cache by running one job to completion first, then launch the rest with the same config (later jobs read-only from the warm cache), or
+- set `use_cache: false` for the parallel jobs and accept the per-run preprocessing cost.
+
+### In-Memory Compression
+
+`use_compression: true` stores preprocessed images and label maps as [blosc](https://www.blosc.org/) bytes both on disk and in RAM; DataLoader workers decompress per sample.
+
+```yaml
+datasets:
+  - name: "large_3d_dataset"
+    use_compression: true
+```
+
+Default is `false`. Enable it when the uncompressed dataset does not fit in host RAM. `use_compression` is part of the cache signature, so toggling triggers a fresh build.
 
 ### CT vs MRI Preprocessing
 
@@ -404,7 +580,7 @@ In multi-dataset configs, CT and MRI are used as **separate datasets** (e.g. one
 datasets:
   - name: "mri_dataset"
     is_ct: false
-    quantile_range: [0.01, 0.99]  # Normalize using quantiles
+    quantile_range: [0.0, 0.99]  # Normalize using quantiles
 ```
 
 **CT:**
@@ -415,23 +591,54 @@ datasets:
     ct_window: [-1000, 1000]  # HU windowing
 ```
 
+To use the same preprocessing at inference time, see [Matching Preprocessing Between Finetuning and Inference](#matching-preprocessing-between-finetuning-and-inference).
+
+### Mixed Modality Datasets
+
+When a dataset contains both CT and MRI images (e.g., cross-modality registration), add a `modality` field to each entry in the JSON file. Any value matching `"ct"` (case-insensitive) uses CT windowing; all other modality values use MRI quantile normalization:
+
+```json
+{
+  "data": [
+    {"image": "/path/patient1_mr.nii.gz", "modality": "mri", "subject_id": "p1"},
+    {"image": "/path/patient1_ct.nii.gz", "modality": "ct", "subject_id": "p1"},
+    {"image": "/path/patient2_mr.nii.gz", "modality": "mri", "subject_id": "p2"},
+    {"image": "/path/patient2_ct.nii.gz", "modality": "ct", "subject_id": "p2"}
+  ]
+}
+```
+
+Both preprocessing parameters can be set in the dataset config:
+
+```yaml
+datasets:
+  - name: "abdomen_mrct"
+    type: "paired"
+    json_file: "mrct_data.json"
+    weight: 1.0
+    quantile_range: [0.0, 0.99]  # Applied to MRI images
+    ct_window: [-1000, 1000]      # Applied to CT images
+```
+
+If `modality` is not specified for an entry, the dataset-level `is_ct` setting is used as the fallback.
+
 ## Troubleshooting
 
 ### "JSON file not found"
-- Check that your `json_file` path is correct and accessible.
-- Use absolute paths to avoid confusion.
+- Verify the path resolves correctly. Relative paths in `json_file` are resolved against the YAML config file's directory, so a config at `configs/foo.yaml` referencing `data.json` looks for `configs/data.json`.
+- Use an absolute path if the config and data live in unrelated directories.
 
-### "Data must be provided"
-- Ensure your JSON file contains the top-level `data` key.
+### "must contain top-level 'data' key"
+- The JSON file is missing the wrapping `{"data": [...]}` object. Wrap your entry list under a `"data"` key.
+
+### "'data' must be provided"
+- The JSON file's `data` list is empty after path resolution. Make sure at least one entry is present and that all `image` paths resolve to existing files.
 
 ### Weights are relative
 - Sampler treats weights as relative multipliers; they do not need to sum to 1.0.
 - Keep weights positive to avoid invalid sampler behavior.
 
 ### Cache takes too much disk space
-- Set `use_cache: false`
-- Delete old caches: `rm -rf results/*_cache`
-- Use `maximum_images` to limit dataset size
-
-### Transforms / augmentation
-- Data augmentation (e.g. spatial transforms) is not included in this finetuning setup. A future option may add an optional `transforms` or `augmentation` section in the training YAML; if so, the same transform would be applied to both moving and fixed (and to segmentations when using segmentation types) to preserve spatial correspondence.
+- Set `use_cache: false`.
+- Delete old caches: remove the signature subdirectory under your `cache_dir` (or `rm -rf results/<experiment>/<signature>/`). Each signature directory contains the `.trch` files plus its `_meta.json`.
+- Use `maximum_images` to limit dataset size.

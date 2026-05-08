@@ -1,12 +1,12 @@
+import logging
 import os
-import sys
 import random
 import footsteps
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
-import icon_registration as icon
 from datetime import datetime
+from typing import Any, Dict, FrozenSet, List, Optional
 from torch.utils.tensorboard import SummaryWriter
 from icon_registration.losses import to_floats
 try:
@@ -14,48 +14,31 @@ try:
 except ImportError:
     wandb = None
 import unigradicon
+from icon_registration import config as icon_config
+from .config import (
+    ConfigSections,
+    ExperimentKeys,
+    FinetuningConfigSchema,
+    TrainingConfig,
+    TrainingKeys,
+    set_reproducibility_seed,
+)
+from .dataset import Fields, PairKeys
+from .visualization import add_eval_composite_panel
+
+logger = logging.getLogger(__name__)
+
+CHECKPOINT_DIR = "checkpoints"
+NETWORK_WEIGHTS_PREFIX = "network_weights"
+OPTIMIZER_WEIGHTS_PREFIX = "optimizer_weights"
+DEFAULT_LOG_PERIOD = 10
 
 
-def loss_to_dict(loss_object):
-    """Convert loss object (ICONLoss or ICONDiceLoss) to dictionary of floats."""
-    def tensor_to_float(tensor):
-        """Convert tensor to float, handling multi-GPU tensors."""
-        if torch.is_tensor(tensor):
-            return torch.mean(tensor).item()
-        return tensor
-    
-    if hasattr(loss_object, 'dice_loss'):
-        return {
-            'all_loss': tensor_to_float(loss_object.all_loss),
-            'inverse_consistency_loss': tensor_to_float(loss_object.inverse_consistency_loss),
-            'similarity_loss': tensor_to_float(loss_object.similarity_loss),
-            'transform_magnitude': tensor_to_float(loss_object.transform_magnitude),
-            'flips': tensor_to_float(loss_object.flips),
-            'dice_loss': tensor_to_float(loss_object.dice_loss),
-        }
-    else:
-        return to_floats(loss_object)._asdict()
+def loss_to_dict(loss_object: Any) -> Dict[str, float]:
+    return to_floats(loss_object)._asdict()
 
 
-def _random_affine_params(batch_size, device):
-    """Create random near-identity affine parameters."""
-    identity_list = []
-    for _ in range(batch_size):
-        identity = torch.tensor([[[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]], device=device)
-        idxs = set((0, 1, 2))
-        for j in range(3):
-            k = random.choice(list(idxs))
-            idxs.remove(k)
-            identity[0, j, k] = 1
-        identity = identity * (torch.randint_like(identity, 0, 2, device=device) * 2 - 1)
-        identity_list.append(identity)
-
-    identity = torch.cat(identity_list)
-    noise = torch.randn((batch_size, 3, 4), device=device)
-    return identity + 0.05 * noise
-
-
-def _affine_warp(image, forward, mode='bilinear'):
+def _affine_warp(image: torch.Tensor, forward: torch.Tensor, mode: str = "bilinear") -> torch.Tensor:
     grid_shape = list(image.shape)
     grid_shape[1] = 3
     forward_grid = F.affine_grid(forward, grid_shape, align_corners=True)
@@ -63,753 +46,433 @@ def _affine_warp(image, forward, mode='bilinear'):
         image,
         forward_grid,
         mode=mode,
-        padding_mode='border',
+        padding_mode="border",
         align_corners=True,
     )
 
 
-def augment(image_A, image_B):
-    """Apply random affine augmentation to image pairs."""
-    device = image_A.device
-    forward = _random_affine_params(image_A.shape[0], device)
-    if image_A.shape[1] > 1:
-        warped_A = _affine_warp(image_A[:, :1], forward)
-        warped_A_seg = _affine_warp(image_A[:, 1:], forward, mode='nearest')
-        warped_A = torch.cat([warped_A, warped_A_seg], axis=1)
-    else:
-        warped_A = _affine_warp(image_A, forward)
+def augment(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Apply random affine augmentation to all spatial data in a batch dict.
 
-    forward = _random_affine_params(image_B.shape[0], device)
+    Images are warped with bilinear interpolation; segmentations and masks
+    use nearest interpolation to preserve label values.
 
-    if image_B.shape[1] > 1:
-        warped_B = _affine_warp(image_B[:, :1], forward)
-        warped_B_seg = _affine_warp(image_B[:, 1:], forward, mode='nearest')
-        warped_B = torch.cat([warped_B, warped_B_seg], axis=1)
-    else:
-        warped_B = _affine_warp(image_B, forward)
-
-    return warped_A, warped_B
-
-
-def augment_with_segmentations(image_A, image_B, seg_A, seg_B):
-    """Apply random affine augmentation to image/segmentation pairs."""
-    forward_A = _random_affine_params(image_A.shape[0], image_A.device)
-    warped_A = _affine_warp(image_A, forward_A)
-    warped_seg_A = _affine_warp(seg_A, forward_A, mode='nearest')
-
-    forward_B = _random_affine_params(image_B.shape[0], image_B.device)
-    warped_B = _affine_warp(image_B, forward_B)
-    warped_seg_B = _affine_warp(seg_B, forward_B, mode='nearest')
-    return warped_A, warped_B, warped_seg_A, warped_seg_B
-
-
-def render_for_tensorboard(im):
-    if len(im.shape) == 5:
-        im = im[:, :, :, im.shape[3] // 2]
-    if torch.min(im) < 0:
-        im = im - torch.min(im)
-    if torch.max(im) > 1:
-        im = im / torch.max(im)
-    return im[:4, [0, 0, 0]].detach().cpu()
-
-
-def segmentation_labels_for_tensorboard(im):
-    if len(im.shape) == 5:
-        im = im[:, :, :, im.shape[3] // 2]
-    if im.shape[1] == 1:
-        return torch.round(im[:4, 0]).long()
-    return torch.argmax(im[:4], dim=1).long()
-
-
-def _hsv_to_rgb(h, s, v):
-    i = torch.floor(h * 6.0).long()
-    f = h * 6.0 - i.float()
-    p = v * (1.0 - s)
-    q = v * (1.0 - f * s)
-    t = v * (1.0 - (1.0 - f) * s)
-    i = i % 6
-
-    r = torch.zeros_like(h)
-    g = torch.zeros_like(h)
-    b = torch.zeros_like(h)
-
-    mask = i == 0
-    r[mask], g[mask], b[mask] = v[mask], t[mask], p[mask]
-    mask = i == 1
-    r[mask], g[mask], b[mask] = q[mask], v[mask], p[mask]
-    mask = i == 2
-    r[mask], g[mask], b[mask] = p[mask], v[mask], t[mask]
-    mask = i == 3
-    r[mask], g[mask], b[mask] = p[mask], q[mask], v[mask]
-    mask = i == 4
-    r[mask], g[mask], b[mask] = t[mask], p[mask], v[mask]
-    mask = i == 5
-    r[mask], g[mask], b[mask] = v[mask], p[mask], q[mask]
-
-    return torch.stack([r, g, b], dim=1)
-
-
-def _segmentation_palette(num_colors, device):
-    palette = torch.zeros((max(num_colors, 1), 3), dtype=torch.float32, device=device)
-    if num_colors <= 1:
-        return palette
-
-    class_ids = torch.arange(1, num_colors, dtype=torch.float32, device=device)
-    hues = torch.remainder(class_ids * 0.61803398875, 1.0)
-    saturation = torch.full_like(hues, 0.75)
-    value = torch.full_like(hues, 0.95)
-    palette[1:] = _hsv_to_rgb(hues, saturation, value)
-    return palette
-
-
-def labels_to_color_image(labels):
-    num_colors = int(labels.max().item()) + 1 if labels.numel() > 0 else 1
-    palette = _segmentation_palette(num_colors, labels.device)
-    color_idx = torch.remainder(labels, palette.shape[0])
-    rgb = palette[color_idx]
-    return rgb.permute(0, 3, 1, 2)
-
-
-def render_segmentation_for_tensorboard(im):
-    labels = segmentation_labels_for_tensorboard(im)
-    return labels_to_color_image(labels).detach().cpu()
-
-
-def render_segmentation_overlay_for_tensorboard(image, segmentation, alpha=0.55):
-    image_rgb = render_for_tensorboard(image).to(segmentation.device)
-    labels = segmentation_labels_for_tensorboard(segmentation)
-    seg_rgb = labels_to_color_image(labels)
-    seg_mask = (labels > 0).unsqueeze(1)
-    overlay = torch.where(
-        seg_mask,
-        (1.0 - alpha) * image_rgb + alpha * seg_rgb,
-        image_rgb,
-    )
-    return overlay.detach().cpu()
-
-
-def render_warped_segmentation_overlay_for_tensorboard(image, warped_segmentation, alpha=0.55):
-    image_rgb = render_for_tensorboard(image).to(warped_segmentation.device)
-    labels = segmentation_labels_for_tensorboard(warped_segmentation)
-    seg_rgb = labels_to_color_image(labels)
-    seg_mask = (labels > 0).unsqueeze(1)
-    overlay = torch.where(
-        seg_mask,
-        (1.0 - alpha) * image_rgb + alpha * seg_rgb,
-        image_rgb,
-    )
-    return overlay.detach().cpu()
-
-
-def add_eval_image_panels(writer, prefix, epoch, moving, fixed, warped):
-    writer.add_images(
-        f"{prefix}/moving_image", render_for_tensorboard(moving[:4]), epoch, dataformats="NCHW"
-    )
-    writer.add_images(
-        f"{prefix}/fixed_image", render_for_tensorboard(fixed[:4]), epoch, dataformats="NCHW"
-    )
-    writer.add_images(
-        f"{prefix}/warped_moving_image",
-        render_for_tensorboard(warped),
-        epoch,
-        dataformats="NCHW",
-    )
-    writer.add_images(
-        f"{prefix}/difference",
-        render_for_tensorboard(torch.clip((warped[:4, :1] - fixed[:4, :1]) + 0.5, 0, 1)),
-        epoch,
-        dataformats="NCHW",
-    )
-
-
-def add_eval_segmentation_panels(
-    writer,
-    prefix,
-    epoch,
-    moving_seg,
-    fixed_seg,
-    warped_seg=None,
-    moving_image=None,
-    fixed_image=None,
-    warped_image=None,
-):
-    writer.add_images(
-        f"{prefix}/moving_segmentation",
-        render_segmentation_for_tensorboard(moving_seg),
-        epoch,
-        dataformats="NCHW",
-    )
-    writer.add_images(
-        f"{prefix}/fixed_segmentation",
-        render_segmentation_for_tensorboard(fixed_seg),
-        epoch,
-        dataformats="NCHW",
-    )
-    if moving_image is not None:
-        writer.add_images(
-            f"{prefix}/moving_overlay",
-            render_segmentation_overlay_for_tensorboard(moving_image, moving_seg),
-            epoch,
-            dataformats="NCHW",
-        )
-    if fixed_image is not None:
-        writer.add_images(
-            f"{prefix}/fixed_overlay",
-            render_segmentation_overlay_for_tensorboard(fixed_image, fixed_seg),
-            epoch,
-            dataformats="NCHW",
-        )
-    if warped_seg is not None:
-        writer.add_images(
-            f"{prefix}/warped_moving_segmentation",
-            render_segmentation_for_tensorboard(warped_seg),
-            epoch,
-            dataformats="NCHW",
-        )
-    if warped_seg is not None and warped_image is not None:
-        writer.add_images(
-            f"{prefix}/warped_moving_overlay",
-            render_warped_segmentation_overlay_for_tensorboard(warped_image, warped_seg),
-            epoch,
-            dataformats="NCHW",
-        )
-
-
-def get_loss_function(similarity_type, sigma=5, mind_radius=2, mind_dilation=2):
-    """Convert similarity type string to loss function object."""
-    similarity_type = similarity_type.lower()
-    
-    if similarity_type == 'lncc':
-        return icon.LNCC(sigma=sigma)
-    elif similarity_type == 'lncc2':
-        return icon.losses.SquaredLNCC(sigma=sigma)
-    elif similarity_type == 'mind':
-        return icon.losses.MINDSSC(radius=mind_radius, dilation=mind_dilation)
-    else:
-        raise ValueError(f"Unknown similarity type: {similarity_type}. Must be one of: lncc, lncc2, mind")
-
-
-def finetune_multi_standard(input_shape, data_loader, val_data_loaders_dict, GPUS, device_ids, 
-                           epochs, eval_period, save_period, learning_rate, weights_path,
-                           lmbda=1.5, loss_fn=None, dice_loss_weight=0.0, use_wandb=True, use_tensorboard=True):
+    Both images share the same random flip/permutation but have slightly
+    different affine noise, so they share orientation but differ in detail.
     """
-    Finetuning with multiple datasets (standard mode: no segmentations).
-    Handles datasets that return 2 outputs: (moving_image, fixed_image).
+    device = batch[PairKeys.IMAGE_A].device
+    batch_size = batch[PairKeys.IMAGE_A].shape[0]
 
-    Args:
-        input_shape: Shape of input images
-        data_loader: Training DataLoader with weighted sampling
-        val_data_loaders_dict: Dict mapping dataset name to validation DataLoader
-        GPUS: Number of GPUs
-        device_ids: List of GPU device IDs
-        epochs: Number of training epochs
-        eval_period: Evaluate every N epochs
-        save_period: Save checkpoint every N epochs
-        learning_rate: Learning rate for optimizer
-        weights_path: Path to model weights (automatically detects if resuming based on optimizer file existence)
-        lmbda: Regularization weight for deformation smoothness
-        loss_fn: Loss function object (e.g., icon.LNCC(sigma=5))
-        dice_loss_weight: Weight for dice loss (typically 0.0 for standard mode)
-        use_wandb: If True, log metrics to Weights & Biases.
-        use_tensorboard: If True, log metrics to TensorBoard.
-    """
-    from datetime import datetime
-    from torch.utils.tensorboard import SummaryWriter
-    from icon_registration.losses import to_floats
-    
-    if loss_fn is None:
-        loss_fn = icon.LNCC(sigma=5)
-    net = unigradicon.make_network(
-        input_shape, 
-        include_last_step=True,
-        lmbda=lmbda,
-        loss_fn=loss_fn,
-        use_label=False,
-        dice_loss_weight=dice_loss_weight
-    )
-    
-    torch.cuda.set_device(device_ids[0])
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
-    
-    # Handle weights path: auto-download if model name is specified
-    if weights_path.lower() in ["unigradicon", "multigradicon"]:
-        model_name = weights_path.lower()
-        weights_path = f"../network_weights/{model_name}1.0/Step_2_final.trch"
-        
-        if not os.path.exists(weights_path):
-            print(f"Downloading pretrained {model_name} model...")
-            import urllib.request
-            download_url = f"https://github.com/uncbiag/uniGradICON/releases/download/{model_name}_weights/Step_2_final.trch"
-            os.makedirs(os.path.dirname(weights_path), exist_ok=True)
-            urllib.request.urlretrieve(download_url, weights_path)
-            print(f"Downloaded to: {weights_path}")
-    
-    print(f"Loading weights from: {weights_path}")
-    net.regis_net.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=True))
-    
-    if GPUS == 1:
-        net_par = net.cuda()
-    else:
-        net_par = torch.nn.DataParallel(net, device_ids=device_ids, output_device=device_ids[0]).cuda()
-    
-    optimizer = torch.optim.Adam(net_par.parameters(), lr=learning_rate)
-    
-    # Try to load optimizer state if available (for resuming training)
-    # The save pattern is: network_weights_{epoch} -> optimizer_weights_{epoch}
-    # Or for full paths: .../Step_2_final.trch -> .../optimizer_weights_Step_2_final.trch
-    if "network_weights" in weights_path:
-        optimizer_path = weights_path.replace("network_weights", "optimizer_weights", 1)
-    else:
-        weights_dir = os.path.dirname(weights_path)
-        weights_filename = os.path.basename(weights_path)
-        optimizer_path = os.path.join(weights_dir, "optimizer_weights_" + weights_filename)
-    
-    if os.path.exists(optimizer_path):
-        print(f"Resuming optimizer from: {optimizer_path}")
-        optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
-    else:
-        print(f"No optimizer state found at {optimizer_path}, starting fresh")
-    
-    net_par.train()
-    
-    writer = None
-    if use_tensorboard:
-        writer = SummaryWriter(
-            footsteps.output_dir + "/logs/" + datetime.now().strftime("%Y%m%d-%H%M%S"),
-            flush_secs=30,
-        )
-    iteration = 0
-    
-    for epoch in tqdm(range(epochs), desc="Epochs"):
-        if use_wandb:
-            wandb.log({"train/learning_rate": learning_rate}, step=iteration)
-        for moving_image, fixed_image in data_loader:
-            moving_image, fixed_image = moving_image.cuda(), fixed_image.cuda()
-            
-            with torch.no_grad():
-                moving_image, fixed_image = augment(moving_image, fixed_image)
-            
-            optimizer.zero_grad()
-            loss_object = net_par(moving_image, fixed_image)
-            loss = torch.mean(loss_object.all_loss)
-            loss.backward()
-            optimizer.step()
-            
-            loss_dict = loss_to_dict(loss_object)
-            for k, v in loss_dict.items():
-                if writer is not None:
-                    writer.add_scalar(f"train/{k}", v, iteration)
-                if use_wandb:
-                    wandb.log({f"train/{k}": v}, step=iteration)
-            
-            if iteration % 10 == 0:
-                loss_str = f"[Epoch {epoch}, Iter {iteration}] "
-                loss_str += " | ".join([f"{k}: {v:.4f}" for k, v in loss_dict.items()])
-                print(f"\n{loss_str}")
-            
-            iteration += 1
-        
-        if epoch % save_period == 0 and epoch > 0:
-            torch.save(
-                optimizer.state_dict(),
-                footsteps.output_dir + f"checkpoints/optimizer_weights_{epoch}",
-            )
-            torch.save(
-                net.regis_net.state_dict(),
-                footsteps.output_dir + f"checkpoints/network_weights_{epoch}",
-            )
-            print(f"\nCheckpoint saved at epoch {epoch}")
-        
-        if epoch % eval_period == 0:
-            net_par.eval()
-            net.eval()
-            with torch.no_grad():
-                for dataset_name, val_loader in val_data_loaders_dict.items():
-                    try:
-                        val_moving, val_fixed = next(iter(val_loader))
-                        val_moving, val_fixed = val_moving.cuda(), val_fixed.cuda()
-                        
-                        val_loss = net(val_moving, val_fixed)
-                        
-                        for k, v in loss_to_dict(val_loss).items():
-                            key = f"{dataset_name}/val_{k}"
-                            if writer is not None:
-                                writer.add_scalar(key, v, epoch)
-                            if use_wandb:
-                                wandb.log({key: v}, step=iteration)
-                        if writer is not None:
-                            add_eval_image_panels(
-                                writer,
-                                dataset_name,
-                                epoch,
-                                val_moving,
-                                val_fixed,
-                                net.warped_image_A,
-                            )
-                        net.clean()
-                    except Exception as e:
-                        print(f"Warning: Validation failed for {dataset_name}: {e}")
-            
-            net_par.train()
-    
+    identity_list = []
+    for _ in range(batch_size):
+        identity = torch.zeros((1, 3, 4), dtype=torch.float32, device=device)
+        idxs = {0, 1, 2}
+        for j in range(3):
+            k = random.choice(list(idxs))
+            idxs.remove(k)
+            identity[0, j, k] = 1
+        identity = identity * (torch.randint_like(identity, 0, 2) * 2 - 1)
+        identity_list.append(identity)
+    identity = torch.cat(identity_list)
+
+    noise_A = torch.randn((batch_size, 3, 4), device=device)
+    forward_A = identity + 0.05 * noise_A
+    noise_B = torch.randn((batch_size, 3, 4), device=device)
+    forward_B = identity + 0.05 * noise_B
+
+    result = {}
+    for key, tensor in batch.items():
+        if not torch.is_tensor(tensor):
+            result[key] = tensor
+            continue
+        forward = forward_A if key.endswith("_A") else forward_B
+        if key.startswith(("image", "label")):
+            result[key] = _affine_warp(tensor, forward, mode="bilinear")
+        else:
+            result[key] = _affine_warp(tensor, forward, mode="nearest")
+
+    return result
+
+
+def _save_checkpoint(net: Any, optimizer: torch.optim.Optimizer, output_dir: str, epoch: Any) -> None:
     torch.save(
         net.regis_net.state_dict(),
-        footsteps.output_dir + "checkpoints/Finetune_multi_final.trch",
+        os.path.join(output_dir, CHECKPOINT_DIR, f"{NETWORK_WEIGHTS_PREFIX}_{epoch}.trch"),
     )
-    print("\nTraining completed!")
-    if writer is not None:
-        writer.close()
-
-
-def finetune_multi_segmentation(input_shape, data_loader, val_data_loaders_dict, GPUS, device_ids,
-                                epochs, eval_period, save_period, learning_rate, weights_path,
-                                lmbda=1.5, loss_fn=None, dice_loss_weight=0.0,
-                                loss_function_masking=False, use_wandb=True, use_tensorboard=True):
-    """
-    Finetuning with multiple datasets (segmentation mode).
-    Handles datasets that return 4 outputs: (moving_image, fixed_image, moving_seg, fixed_seg).
-
-    Args:
-        input_shape: Shape of input images
-        data_loader: Training DataLoader with weighted sampling
-        val_data_loaders_dict: Dict mapping dataset name to validation DataLoader
-        GPUS: Number of GPUs
-        device_ids: List of GPU device IDs
-        epochs: Number of training epochs
-        eval_period: Evaluate every N epochs
-        save_period: Save checkpoint every N epochs
-        learning_rate: Learning rate for optimizer
-        weights_path: Path to model weights (automatically detects if resuming based on optimizer file existence)
-        lmbda: Regularization weight for deformation smoothness
-        loss_fn: Loss function object (e.g., icon.LNCC(sigma=5))
-        dice_loss_weight: Weight for dice loss (recommended: 0.3-0.5 for segmentation mode)
-        loss_function_masking: Apply segmentation masking to similarity loss.
-        use_wandb: If True, log metrics to Weights & Biases.
-        use_tensorboard: If True, log metrics to TensorBoard.
-    """
-    if loss_fn is None:
-        loss_fn = icon.LNCC(sigma=5)
-    
-    # Create network with segmentation support
-    net = unigradicon.make_network(
-        input_shape, 
-        include_last_step=True,
-        lmbda=lmbda,
-        loss_fn=loss_fn,
-        use_label=True,
-        dice_loss_weight=dice_loss_weight,
-        loss_function_masking=loss_function_masking,
+    torch.save(
+        optimizer.state_dict(),
+        os.path.join(output_dir, CHECKPOINT_DIR, f"{OPTIMIZER_WEIGHTS_PREFIX}_{epoch}.trch"),
     )
-    torch.cuda.set_device(device_ids[0])
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
-    
-    # Handle weights path: auto-download if model name is specified
-    if weights_path.lower() in ["unigradicon", "multigradicon"]:
-        model_name = weights_path.lower()
-        weights_path = f"../network_weights/{model_name}1.0/Step_2_final.trch"
-        
-        if not os.path.exists(weights_path):
-            print(f"Downloading pretrained {model_name} model...")
-            import urllib.request
-            download_url = f"https://github.com/uncbiag/uniGradICON/releases/download/{model_name}_weights/Step_2_final.trch"
-            os.makedirs(os.path.dirname(weights_path), exist_ok=True)
-            urllib.request.urlretrieve(download_url, weights_path)
-            print(f"Downloaded to: {weights_path}")
-    
-    print(f"Loading weights from: {weights_path}")
-    net.regis_net.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=True))
-    
-    if GPUS == 1:
-        net_par = net.cuda()
+
+
+def _load_network_weights(net: Any, model_weights: str, loss_fn: Any, settings: TrainingConfig) -> Optional[str]:
+    """Load pretrained model-zoo weights or a custom checkpoint path.
+
+    Returns the resolved weights path so ``_build_optimizer`` can locate the
+    matching optimizer state file and resume from it; returns ``None`` when
+    model-zoo weights were used (no companion optimizer state to look for).
+    """
+    # A local file on disk wins over the model-zoo name match so a literal
+    # file named ``unigradicon`` (or any case variant) is treated as a path.
+    is_zoo_name = (
+        not os.path.exists(model_weights)
+        and model_weights.lower() in ("unigradicon", "multigradicon")
+    )
+    if is_zoo_name:
+        pretrained_net = unigradicon.get_model_from_model_zoo(
+            model_name=model_weights.lower(),
+            loss_fn=loss_fn,
+            dice_loss_weight=settings.dice_loss_weight,
+            loss_function_masking=settings.loss_function_masking,
+        )
+        # Explicit ``strict=True`` catches architecture drift between
+        # ``make_network`` and ``get_model_from_model_zoo``.
+        net.regis_net.load_state_dict(pretrained_net.regis_net.state_dict(), strict=True)
+        return None
+
+    weights_path = os.path.abspath(model_weights)
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"Model weights not found: {model_weights} (resolved to {weights_path})")
+    logger.info(f"Loading network weights from {weights_path}.")
+    net.regis_net.load_state_dict(
+        torch.load(weights_path, map_location="cpu", weights_only=True),
+        strict=True,
+    )
+    return weights_path
+
+
+def _optimizer_state_path(model_weights: str) -> str:
+    weights_filename = os.path.basename(model_weights)
+    weights_dir = os.path.dirname(model_weights)
+    if weights_filename.startswith(NETWORK_WEIGHTS_PREFIX):
+        optimizer_filename = weights_filename.replace(NETWORK_WEIGHTS_PREFIX, OPTIMIZER_WEIGHTS_PREFIX, 1)
     else:
-        net_par = torch.nn.DataParallel(net, device_ids=device_ids, output_device=device_ids[0]).cuda()
-    
-    optimizer = torch.optim.Adam(net_par.parameters(), lr=learning_rate)
-    
-    # Try to load optimizer state if available (for resuming training)
-    # The save pattern is: network_weights_{epoch} -> optimizer_weights_{epoch}
-    # Or for full paths: .../Step_2_final.trch -> .../optimizer_weights_Step_2_final.trch
-    if "network_weights" in weights_path:
-        optimizer_path = weights_path.replace("network_weights", "optimizer_weights", 1)
-    else:
-        weights_dir = os.path.dirname(weights_path)
-        weights_filename = os.path.basename(weights_path)
-        optimizer_path = os.path.join(weights_dir, "optimizer_weights_" + weights_filename)
-    
+        optimizer_filename = f"{OPTIMIZER_WEIGHTS_PREFIX}_{weights_filename}"
+    return os.path.join(weights_dir, optimizer_filename)
+
+
+def _build_optimizer(
+    net: Any,
+    learning_rate: float,
+    model_weights: Optional[str],
+) -> torch.optim.Optimizer:
+    """Build the Adam optimizer over the registration network parameters.
+
+    Uses ``net.regis_net.parameters()`` so that the optimizer is bound to the
+    same module whose ``state_dict`` is saved/loaded for checkpoints. This keeps
+    parameter ordering stable regardless of whether the network is wrapped in
+    DataParallel, which makes single-GPU ↔ multi-GPU resumes safe.
+    """
+    optimizer = torch.optim.Adam(net.regis_net.parameters(), lr=learning_rate)
+    if model_weights is None:
+        logger.info("Initializing optimizer from scratch (model-zoo weights have no companion optimizer state).")
+        return optimizer
+
+    optimizer_path = _optimizer_state_path(model_weights)
     if os.path.exists(optimizer_path):
-        print(f"Resuming optimizer from: {optimizer_path}")
+        logger.info(f"Resuming optimizer state from {optimizer_path}.")
         optimizer.load_state_dict(torch.load(optimizer_path, map_location="cpu", weights_only=False))
     else:
-        print(f"No optimizer state found at {optimizer_path}, starting fresh")
-    
-    net_par.train()
-    
-    writer = None
-    if use_tensorboard:
-        writer = SummaryWriter(
-            footsteps.output_dir + "/logs/" + datetime.now().strftime("%Y%m%d-%H%M%S"),
-            flush_secs=30,
-        )
-    
-    print("Starting multi-dataset training (segmentation mode)...")
-    iteration = 0
-    
-    for epoch in tqdm(range(epochs), desc="Epochs"):
-        if use_wandb:
-            wandb.log({"train/learning_rate": learning_rate}, step=iteration)
-        for moving_image, fixed_image, moving_seg, fixed_seg in data_loader:
-            moving_image = moving_image.cuda()
-            fixed_image = fixed_image.cuda()
-            moving_seg = moving_seg.cuda()
-            fixed_seg = fixed_seg.cuda()
+        logger.info(f"Optimizer state not found at {optimizer_path}; initializing optimizer from scratch.")
+    return optimizer
 
-            with torch.no_grad():
-                moving_image, fixed_image, moving_seg, fixed_seg = augment_with_segmentations(
-                    moving_image,
-                    fixed_image,
-                    moving_seg,
-                    fixed_seg,
+
+def _build_forward_kwargs(
+    batch: Dict[str, torch.Tensor],
+    settings: TrainingConfig,
+    data_fields: FrozenSet[str],
+) -> Dict[str, torch.Tensor]:
+    forward_kwargs = {}
+    if settings.use_label and PairKeys.LABEL_A in batch:
+        forward_kwargs[PairKeys.LABEL_A] = batch[PairKeys.LABEL_A]
+        forward_kwargs[PairKeys.LABEL_B] = batch[PairKeys.LABEL_B]
+    if settings.dice_loss_weight > 0.0 and Fields.SEGMENTATION in data_fields:
+        forward_kwargs[PairKeys.SEGMENTATION_A] = batch[PairKeys.SEGMENTATION_A]
+        forward_kwargs[PairKeys.SEGMENTATION_B] = batch[PairKeys.SEGMENTATION_B]
+    if settings.loss_function_masking and Fields.MASK in data_fields:
+        forward_kwargs[PairKeys.MASK_A] = batch[PairKeys.MASK_A]
+        forward_kwargs[PairKeys.MASK_B] = batch[PairKeys.MASK_B]
+    return forward_kwargs
+
+
+def _log_loss_scalars(writer: SummaryWriter, prefix: str, loss_dict: Dict[str, float], iteration: int) -> None:
+    for key, value in loss_dict.items():
+        writer.add_scalar(f"{prefix}/{key}", value, iteration)
+
+
+def _apply_roi_masking(batch: Dict[str, torch.Tensor]) -> None:
+    """Zero out background under the ROI mask. Applied to both training and
+    validation batches so the network sees the same input distribution in
+    both phases."""
+    batch[PairKeys.IMAGE_A] = batch[PairKeys.IMAGE_A] * (batch[PairKeys.MASK_A] > 0).float()
+    batch[PairKeys.IMAGE_B] = batch[PairKeys.IMAGE_B] * (batch[PairKeys.MASK_B] > 0).float()
+
+
+def _train_one_batch(
+    net: Any,
+    net_par: Any,
+    optimizer: torch.optim.Optimizer,
+    batch: Dict[str, torch.Tensor],
+    settings: TrainingConfig,
+    data_fields: FrozenSet[str],
+    device: torch.device,
+) -> Dict[str, float]:
+    batch = {key: value.to(device) for key, value in batch.items()}
+    with torch.no_grad():
+        batch = augment(batch)
+
+    if settings.roi_masking:
+        _apply_roi_masking(batch)
+
+    optimizer.zero_grad()
+    forward_kwargs = _build_forward_kwargs(batch, settings, data_fields)
+    loss_object = net_par(batch[PairKeys.IMAGE_A], batch[PairKeys.IMAGE_B], **forward_kwargs)
+    loss = torch.mean(loss_object.all_loss)
+    loss.backward()
+    optimizer.step()
+    net.clean()
+    return loss_to_dict(loss_object)
+
+
+def _run_validation(
+    net: Any,
+    net_par: Any,
+    val_data_loaders_dict: Dict[str, Any],
+    writer: SummaryWriter,
+    iteration: int,
+    settings: TrainingConfig,
+    data_fields: FrozenSet[str],
+    device: torch.device,
+) -> None:
+    if not val_data_loaders_dict:
+        return
+
+    ds_name, val_loader = random.choice(list(val_data_loaders_dict.items()))
+
+    net_par.eval()
+    net.eval()
+    try:
+        with torch.no_grad():
+            val_batch = next(iter(val_loader))
+            val_batch = {key: value.to(device) for key, value in val_batch.items()}
+            if settings.roi_masking:
+                _apply_roi_masking(val_batch)
+            forward_kwargs = _build_forward_kwargs(val_batch, settings, data_fields)
+            val_loss = net(val_batch[PairKeys.IMAGE_A], val_batch[PairKeys.IMAGE_B], **forward_kwargs)
+            _log_loss_scalars(writer, f"val/{ds_name}", loss_to_dict(val_loss), iteration)
+            _write_eval_visualizations(
+                writer,
+                iteration,
+                val_batch,
+                net,
+                settings,
+                data_fields,
+                ds_name,
+            )
+            net.clean()
+    finally:
+        net_par.train()
+
+
+def _write_eval_visualizations(
+    writer: SummaryWriter,
+    iteration: int,
+    val_batch: Dict[str, torch.Tensor],
+    net: Any,
+    settings: TrainingConfig,
+    data_fields: FrozenSet[str],
+    ds_name: str,
+) -> None:
+    has_seg = Fields.SEGMENTATION in data_fields
+    has_mask = Fields.MASK in data_fields
+
+    warped_seg = None
+    if has_seg and settings.dice_loss_weight > 0.0 and hasattr(net, "warped_seg_A"):
+        warped_seg = net.warped_seg_A
+
+    add_eval_composite_panel(
+        writer,
+        iteration,
+        moving=val_batch[PairKeys.IMAGE_A],
+        fixed=val_batch[PairKeys.IMAGE_B],
+        warped=net.warped_image_A,
+        moving_seg=val_batch[PairKeys.SEGMENTATION_A] if has_seg else None,
+        fixed_seg=val_batch[PairKeys.SEGMENTATION_B] if has_seg else None,
+        warped_seg=warped_seg,
+        moving_mask=val_batch[PairKeys.MASK_A] if has_mask else None,
+        fixed_mask=val_batch[PairKeys.MASK_B] if has_mask else None,
+        tag=f"eval/{ds_name}",
+    )
+
+
+def finetune_multi(
+    config: Dict[str, Any],
+    data_loader: Any,
+    val_data_loaders_dict: Dict[str, Any],
+    data_fields: FrozenSet[str],
+) -> None:
+    """
+    Unified finetuning loop.
+
+    The training step uses ``net_par`` (the DataParallel-wrapped network) so
+    forward/backward can scatter across GPUs. Validation, checkpoint saving,
+    and the optimizer use the unwrapped ``net``/``net.regis_net`` so behavior
+    is independent of the parallel wrapping.
+
+    Args:
+        config: Full configuration dict with 'experiment' and 'training' sections.
+        data_loader: Training DataLoader with weighted sampling.
+        val_data_loaders_dict: Dict mapping dataset name to validation DataLoader.
+        data_fields: Frozenset of auxiliary data fields (e.g. {"segmentation", "mask"}).
+    """
+    schema = FinetuningConfigSchema.from_dict(config)
+    settings = schema.training
+    exp_config = config[ConfigSections.EXPERIMENT]
+    device = icon_config.device
+
+    if device.type == "cuda":
+        available = torch.cuda.device_count()
+        invalid = [g for g in settings.gpus if g < 0 or g >= available]
+        if invalid:
+            raise ValueError(
+                f"Requested GPU(s) {invalid} not available; "
+                f"torch.cuda.device_count() reports {available} GPU(s)."
+            )
+        torch.cuda.set_device(settings.gpus[0])
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = True
+
+    loss_fn = unigradicon.make_sim(
+        settings.similarity.lower(),
+        sigma=settings.lncc_sigma,
+        mind_radius=settings.mind_radius,
+        mind_dilation=settings.mind_dilation,
+    )
+    net = unigradicon.make_network(
+        settings.network_input_shape,
+        include_last_step=True,
+        lmbda=settings.lmbda,
+        loss_fn=loss_fn,
+        use_label=settings.use_label,
+        dice_loss_weight=settings.dice_loss_weight,
+        loss_function_masking=settings.loss_function_masking,
+    )
+    model_weights = _load_network_weights(net, exp_config[ExperimentKeys.MODEL_WEIGHTS], loss_fn, settings)
+
+    if device.type == "cuda" and len(settings.gpus) > 1:
+        net_par = torch.nn.DataParallel(
+            net, device_ids=settings.gpus, output_device=settings.gpus[0]
+        ).to(device)
+    else:
+        net_par = net.to(device)
+
+    optimizer = _build_optimizer(net, settings.learning_rate, model_weights)
+    net_par.train()
+    os.makedirs(os.path.join(footsteps.output_dir, CHECKPOINT_DIR), exist_ok=True)
+    writer = SummaryWriter(
+        os.path.join(footsteps.output_dir, "logs", datetime.now().strftime("%Y%m%d-%H%M%S")),
+        flush_secs=30,
+    )
+
+    logger.info("Starting training loop.")
+    logger.info(f"Auxiliary data fields: {sorted(data_fields) if data_fields else 'images only'}.")
+    logger.info(
+        f"Schedule: epochs={settings.epochs}, learning_rate={settings.learning_rate}, "
+        f"gpus={settings.gpus}, eval_period={settings.eval_period}, save_period={settings.save_period}."
+    )
+    logger.info(
+        f"Loss configuration: similarity={settings.similarity}, lambda={settings.lmbda}, "
+        f"dice_loss_weight={settings.dice_loss_weight}, "
+        f"loss_function_masking={settings.loss_function_masking}, "
+        f"roi_masking={settings.roi_masking}, use_label={settings.use_label}."
+    )
+
+    iteration = 0
+
+    try:
+        for epoch in tqdm(range(settings.epochs), desc="Training epochs"):
+            for batch in data_loader:
+                loss_dict = _train_one_batch(
+                    net,
+                    net_par,
+                    optimizer,
+                    batch,
+                    settings,
+                    data_fields,
+                    device,
                 )
-            
-            optimizer.zero_grad()
-            loss_object = net_par(moving_image, fixed_image, mask_A=moving_seg, mask_B=fixed_seg)
-            loss = torch.mean(loss_object.all_loss)
-            loss.backward()
-            optimizer.step()
-            
-            loss_dict = loss_to_dict(loss_object)
-            for k, v in loss_dict.items():
-                if writer is not None:
-                    writer.add_scalar(f"train/{k}", v, iteration)
-                if use_wandb:
-                    wandb.log({f"train/{k}": v}, step=iteration)
-            
-            if iteration % 10 == 0:
-                loss_str = f"[Epoch {epoch}, Iter {iteration}] "
-                loss_str += " | ".join([f"{k}: {v:.4f}" for k, v in loss_dict.items()])
-                print(f"\n{loss_str}")
-            
-            iteration += 1
-        
-        if epoch % save_period == 0 and epoch > 0:
-            torch.save(
-                optimizer.state_dict(),
-                footsteps.output_dir + f"checkpoints/optimizer_weights_{epoch}",
-            )
-            torch.save(
-                net.regis_net.state_dict(),
-                footsteps.output_dir + f"checkpoints/network_weights_{epoch}",
-            )
-            print(f"\nCheckpoint saved at epoch {epoch}")
-        
-        if epoch % eval_period == 0:
-            net_par.eval()
-            net.eval()
-            with torch.no_grad():
-                for dataset_name, val_loader in val_data_loaders_dict.items():
-                    try:
-                        val_moving, val_fixed, val_moving_seg, val_fixed_seg = next(iter(val_loader))
-                        val_moving = val_moving.cuda()
-                        val_fixed = val_fixed.cuda()
-                        val_moving_seg = val_moving_seg.cuda()
-                        val_fixed_seg = val_fixed_seg.cuda()
-                        
-                        val_loss = net(
-                            val_moving,
-                            val_fixed,
-                            mask_A=val_moving_seg,
-                            mask_B=val_fixed_seg,
-                        )
-                        
-                        for k, v in loss_to_dict(val_loss).items():
-                            key = f"{dataset_name}/val_{k}"
-                            if writer is not None:
-                                writer.add_scalar(key, v, epoch)
-                            if use_wandb:
-                                wandb.log({key: v}, step=iteration)
-                        if writer is not None:
-                            add_eval_image_panels(
-                                writer,
-                                dataset_name,
-                                epoch,
-                                val_moving,
-                                val_fixed,
-                                net.warped_image_A,
-                            )
-                            warped_seg_for_viz = None
-                            if dice_loss_weight > 0.0 and hasattr(net, "warped_seg_A"):
-                                warped_seg_for_viz = net.warped_seg_A
-                            add_eval_segmentation_panels(
-                                writer,
-                                dataset_name,
-                                epoch,
-                                val_moving_seg,
-                                val_fixed_seg,
-                                warped_seg_for_viz,
-                                moving_image=val_moving,
-                                fixed_image=val_fixed,
-                                warped_image=net.warped_image_A,
-                            )
-                        net.clean()
-                    except Exception as e:
-                        print(f"Warning: Validation failed for {dataset_name}: {e}")
-            
-            net_par.train()
-    
-    torch.save(
-        net.regis_net.state_dict(),
-        footsteps.output_dir + "checkpoints/Finetune_multi_final.trch",
-    )
-    print("\nTraining completed!")
-    if writer is not None:
+                _log_loss_scalars(writer, "train", loss_dict, iteration)
+
+                if iteration % DEFAULT_LOG_PERIOD == 0:
+                    loss_str = " | ".join([f"{k}={v:.4f}" for k, v in loss_dict.items()])
+                    logger.info(f"[epoch {epoch}, iteration {iteration}] {loss_str}")
+
+                iteration += 1
+
+            is_last_epoch = (epoch == settings.epochs - 1)
+            is_periodic_save = (epoch > 0 and epoch % settings.save_period == 0)
+            if is_periodic_save and not is_last_epoch:
+                _save_checkpoint(net, optimizer, footsteps.output_dir, epoch)
+                logger.info(f"Wrote checkpoint for epoch {epoch}.")
+
+            if epoch % settings.eval_period == 0:
+                _run_validation(
+                    net,
+                    net_par,
+                    val_data_loaders_dict,
+                    writer,
+                    iteration,
+                    settings,
+                    data_fields,
+                    device,
+                )
+
+        _save_checkpoint(net, optimizer, footsteps.output_dir, "final")
+        logger.info("Training loop completed; final checkpoint written.")
+    finally:
         writer.close()
 
-def main(argv=None):
+
+def main(argv: Optional[List[str]] = None) -> None:
     import argparse
-    from . import multi_dataset_loader
+    from .config import load_config, create_data_loaders, validate_config
+
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
     parser = argparse.ArgumentParser(description="Finetuning for uniGradICON")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
-    
-    args = parser.parse_args(argv)
-    
-    train_loader, val_loaders, config, mode = multi_dataset_loader.create_multi_dataset_loaders(args.config)
-    
-    exp_config = config['experiment']
-    train_config = config['training']
-    
-    footsteps.initialize(run_name=exp_config['name'])
-    os.makedirs(footsteps.output_dir + "checkpoints", exist_ok=True)
-    
-    use_wandb = exp_config.get('use_wandb', True)
-    use_tensorboard = exp_config.get('use_tensorboard', True)
-    if use_wandb and wandb is None:
-        raise ImportError(
-            "use_wandb is True but wandb is not installed. "
-            "Install with: pip install wandb. Or set use_wandb: false in your config."
-        )
-    if use_wandb:
-        wandb_project = exp_config.get('wandb_project', 'unigradicon-finetune')
-        wandb_entity = exp_config.get('wandb_entity', None)
-        wandb_run_name = exp_config.get('wandb_run_name', exp_config['name'])
-        wandb_config = {
-            **{f'experiment_{k}': v for k, v in exp_config.items() if k not in ('use_wandb', 'use_tensorboard', 'wandb_project', 'wandb_entity', 'wandb_run_name')},
-            **{f'training_{k}': v for k, v in train_config.items()},
-            'datasets_count': len(config['datasets']),
-            'datasets_names': [d.get('name', d.get('type', 'unknown')) for d in config['datasets']],
-        }
-        wandb.init(project=wandb_project, entity=wandb_entity, name=wandb_run_name, config=wandb_config)
-    
-    print(f"\nExperiment: {exp_config['name']}")
-    print(f"Mode: {mode}")
-    print(f"Training on {len(config['datasets'])} dataset(s)")
-    
-    input_shape_multi = [1, 1] + train_config['input_shape']
-    device_ids_multi = train_config['gpus']
-    gpus_multi = len(device_ids_multi)
-    
-    weights_path = exp_config['weights_path']
-    
-    epochs = train_config['epochs']
-    eval_period = train_config['eval_period']
-    save_period = train_config['save_period']
-    learning_rate = train_config.get('learning_rate', 0.00005)
-    
-    similarity_type = train_config.get('similarity', 'lncc')
-    lmbda = train_config.get('lambda', 1.5)
-    dice_loss_weight = train_config.get('dice_loss_weight', 0.0)
-    loss_function_masking = train_config.get('loss_function_masking', False)
-    lncc_sigma = train_config.get('lncc_sigma', 5)
-    mind_radius = train_config.get('mind_radius', 2)
-    mind_dilation = train_config.get('mind_dilation', 2)
-    
-    loss_fn = get_loss_function(similarity_type, sigma=lncc_sigma, 
-                                mind_radius=mind_radius, mind_dilation=mind_dilation)
-    
-    print(f"\nTraining parameters:")
-    print(f"  Epochs: {epochs}")
-    print(f"  Batch size: {train_config['batch_size']}")
-    print(f"  GPUs: {device_ids_multi}")
-    print(f"  Learning rate: {learning_rate}")
-    print(f"  Weights: {weights_path}")
-    
-    print(f"\nLoss function configuration:")
-    print(f"  Similarity: {similarity_type}")
-    print(f"  Lambda (regularization): {lmbda}")
-    print(f"  Dice loss weight: {dice_loss_weight}")
-    print(f"  Loss function masking: {loss_function_masking}")
-    if similarity_type in ['lncc', 'lncc2']:
-        print(f"  LNCC sigma: {lncc_sigma}")
-    elif similarity_type == 'mind':
-        print(f"  MIND radius: {mind_radius}")
-        print(f"  MIND dilation: {mind_dilation}")
 
-    if mode == 'standard' and loss_function_masking:
-        raise ValueError(
-            "loss_function_masking requires segmentation datasets. "
-            "Use dataset type 'unpaired_with_seg' or 'paired_with_seg'."
-        )
-    if mode == 'standard' and dice_loss_weight > 0.0:
-        raise ValueError(
-            "dice_loss_weight requires segmentation datasets. "
-            "Set dice_loss_weight to 0.0 for standard datasets."
-        )
-    if loss_function_masking and dice_loss_weight > 0.0:
-        raise ValueError(
-            "loss_function_masking and dice_loss_weight are mutually exclusive in finetuning. "
-            "Set dice_loss_weight to 0.0 when using loss_function_masking."
-        )
-    
-    if mode == 'standard':
-        print("\nStarting standard mode training (no segmentations)...")
-        finetune_multi_standard(
-            input_shape=input_shape_multi,
-            data_loader=train_loader,
-            val_data_loaders_dict=val_loaders,
-            GPUS=gpus_multi,
-            device_ids=device_ids_multi,
-            epochs=epochs,
-            eval_period=eval_period,
-            save_period=save_period,
-            learning_rate=learning_rate,
-            weights_path=weights_path,
-            lmbda=lmbda,
-            loss_fn=loss_fn,
-            dice_loss_weight=dice_loss_weight,
-            use_wandb=use_wandb,
-            use_tensorboard=use_tensorboard,
-        )
-    elif mode == 'segmentation':
-        print("\nStarting segmentation mode training (with segmentations)...")
-        finetune_multi_segmentation(
-            input_shape=input_shape_multi,
-            data_loader=train_loader,
-            val_data_loaders_dict=val_loaders,
-            GPUS=gpus_multi,
-            device_ids=device_ids_multi,
-            epochs=epochs,
-            eval_period=eval_period,
-            save_period=save_period,
-            learning_rate=learning_rate,
-            weights_path=weights_path,
-            lmbda=lmbda,
-            loss_fn=loss_fn,
-            dice_loss_weight=dice_loss_weight,
-            loss_function_masking=loss_function_masking,
-            use_wandb=use_wandb,
-            use_tensorboard=use_tensorboard,
-        )
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-    
-    if use_wandb:
-        wandb.finish()
-        
-    print("\n" + "=" * 60)
-    print("FINETUNING COMPLETED")
-    print("=" * 60)
+    args = parser.parse_args(argv)
+
+    config = load_config(args.config)
+    validate_config(config)
+    exp_config = config[ConfigSections.EXPERIMENT]
+
+    seed = config.get(ConfigSections.TRAINING, {}).get(TrainingKeys.SEED)
+    set_reproducibility_seed(seed)
+    if seed is not None:
+        logger.info(f"Reproducibility seed set: {seed}.")
+
+    os.makedirs("results", exist_ok=True)
+    footsteps.initialize(run_name=exp_config[ExperimentKeys.NAME])
+
+    loaders = create_data_loaders(args.config, config=config)
+    config = loaders.config
+
+    logger.info(
+        f"Experiment '{exp_config[ExperimentKeys.NAME]}' ready: "
+        f"{len(config[ConfigSections.DATASETS])} dataset(s), "
+        f"auxiliary fields={sorted(loaders.data_fields) if loaders.data_fields else 'images only'}."
+    )
+
+    finetune_multi(
+        config=config,
+        data_loader=loaders.train_loader,
+        val_data_loaders_dict=loaders.val_loaders,
+        data_fields=loaders.data_fields,
+    )
+
+    logger.info("Finetuning run completed successfully.")
 
 
 if __name__ == "__main__":

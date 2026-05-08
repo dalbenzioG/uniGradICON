@@ -1,7 +1,6 @@
 experiment:
   name: "example_seg_experiment"
-  model: "unigradicon"
-  weights_path: "../network_weights/unigradicon1.0/Step_2_final.trch"
+  model_weights: "unigradicon"  # Auto-downloads pretrained weights; or set to a local path
 
 training:
   batch_size: 4
@@ -19,7 +18,7 @@ training:
 
 datasets:
   - name: "example_seg_dataset"
-    type: "unpaired_with_seg"
+    type: "unpaired"
     json_file: "example_seg.json"
     weight: 1.0
     is_ct: true
