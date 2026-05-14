@@ -42,6 +42,10 @@ class ConfigSections:
 class ExperimentKeys:
     NAME = 'name'
     MODEL_WEIGHTS = 'model_weights'
+    USE_WANDB = 'use_wandb'
+    WANDB_PROJECT = 'wandb_project'
+    WANDB_ENTITY = 'wandb_entity'
+    WANDB_RUN_NAME = 'wandb_run_name'
 
 
 class TrainingKeys:
@@ -79,6 +83,9 @@ class DatasetKeys:
     CT_WINDOW = 'ct_window'
     QUANTILE_RANGE = 'quantile_range'
     SHUFFLE = 'shuffle'
+    INIT_TRANSFORM_DIR = 'init_transform_dir'
+    INIT_TRANSFORM_DIRECTION = 'init_transform_direction'
+    INIT_TRANSFORM_TEMPLATE = 'init_transform_template'
 
 
 class DatasetTypes:
@@ -97,6 +104,7 @@ OPTIONAL_DATA_FIELDS = frozenset({dataset.Fields.SEGMENTATION, dataset.Fields.MA
 # Must mirror unigradicon.make_sim's accepted values; runtime lowercases before
 # dispatching, so this set is the canonical lowercase form.
 VALID_SIMILARITIES = frozenset({"lncc", "lncc2", "mind"})
+VALID_INIT_TRANSFORM_DIRECTIONS = frozenset({"ct_to_us", "us_to_ct"})
 
 # YAML uses "lambda" but ``lambda`` is a Python keyword, so the dataclass
 # field is named ``lmbda``; this alias bridges the two.
@@ -107,6 +115,7 @@ DEFAULT_VAL_BATCH_SIZE = 1
 DEFAULT_DROP_LAST = True
 DEFAULT_PIN_MEMORY = True
 DEFAULT_SAMPLER_REPLACEMENT = True
+DEFAULT_WANDB_PROJECT = "unigradicon-finetune"
 
 
 def _schema_kwargs(raw: Dict[str, Any], schema_cls, aliases: Dict[str, str]) -> Dict[str, Any]:
@@ -134,12 +143,21 @@ def _yaml_keys_for_dataclass(schema_cls, aliases: Dict[str, str]) -> set:
 class ExperimentConfig:
     name: str
     model_weights: str
+    use_wandb: bool = False
+    wandb_project: str = DEFAULT_WANDB_PROJECT
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "ExperimentConfig":
+        kwargs = _schema_kwargs(raw, cls, {})
         return cls(
-            name=raw[ExperimentKeys.NAME],
-            model_weights=raw[ExperimentKeys.MODEL_WEIGHTS],
+            name=kwargs[ExperimentKeys.NAME],
+            model_weights=kwargs[ExperimentKeys.MODEL_WEIGHTS],
+            use_wandb=kwargs.get(ExperimentKeys.USE_WANDB, False),
+            wandb_project=kwargs.get(ExperimentKeys.WANDB_PROJECT, DEFAULT_WANDB_PROJECT),
+            wandb_entity=kwargs.get(ExperimentKeys.WANDB_ENTITY),
+            wandb_run_name=kwargs.get(ExperimentKeys.WANDB_RUN_NAME),
         )
 
 
@@ -231,6 +249,7 @@ class FinetuningConfigSchema:
 
 VALID_TRAINING_KEYS = _yaml_keys_for_dataclass(TrainingConfig, TRAINING_FIELD_ALIASES)
 VALID_DATASET_KEYS = _yaml_keys_for_dataclass(DatasetConfig, DATASET_FIELD_ALIASES)
+VALID_EXPERIMENT_KEYS = _yaml_keys_for_dataclass(ExperimentConfig, {})
 
 
 @dataclass
@@ -262,6 +281,23 @@ class ConfigValidator:
         for key in REQUIRED_EXPERIMENT_KEYS:
             if key not in exp:
                 raise ValueError(f"Missing required experiment key: '{key}'")
+        unknown = set(exp.keys()) - VALID_EXPERIMENT_KEYS
+        if unknown:
+            logger.warning(f"Unrecognized experiment keys (possible typos): {sorted(unknown)}.")
+
+        if ExperimentKeys.USE_WANDB in exp and not isinstance(exp[ExperimentKeys.USE_WANDB], bool):
+            raise ValueError(f"'{ExperimentKeys.USE_WANDB}' must be a boolean")
+
+        if ExperimentKeys.WANDB_PROJECT in exp:
+            project = exp[ExperimentKeys.WANDB_PROJECT]
+            if not isinstance(project, str) or not project.strip():
+                raise ValueError(f"'{ExperimentKeys.WANDB_PROJECT}' must be a non-empty string")
+
+        for optional_text_key in (ExperimentKeys.WANDB_ENTITY, ExperimentKeys.WANDB_RUN_NAME):
+            if optional_text_key in exp and exp[optional_text_key] is not None:
+                value = exp[optional_text_key]
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"'{optional_text_key}' must be a non-empty string or null")
 
     def _validate_training(self) -> None:
         if ConfigSections.TRAINING not in self.config:
@@ -339,6 +375,34 @@ class ConfigValidator:
                 raise ValueError(
                     f"Dataset '{dataset_config.name}': unknown type '{dataset_config.type}'. "
                     f"Must be '{DatasetTypes.UNPAIRED}' or '{DatasetTypes.PAIRED}'."
+                )
+            if dataset_config.init_transform_dir is not None:
+                if dataset_config.type != DatasetTypes.PAIRED:
+                    raise ValueError(
+                        f"Dataset '{dataset_config.name}': '{DatasetKeys.INIT_TRANSFORM_DIR}' "
+                        f"requires dataset type '{DatasetTypes.PAIRED}'."
+                    )
+                if (
+                    not isinstance(dataset_config.init_transform_dir, str)
+                    or not dataset_config.init_transform_dir.strip()
+                ):
+                    raise ValueError(
+                        f"Dataset '{dataset_config.name}': '{DatasetKeys.INIT_TRANSFORM_DIR}' "
+                        f"must be a non-empty string when provided."
+                    )
+            if dataset_config.init_transform_direction not in VALID_INIT_TRANSFORM_DIRECTIONS:
+                raise ValueError(
+                    f"Dataset '{dataset_config.name}': '{DatasetKeys.INIT_TRANSFORM_DIRECTION}' "
+                    f"must be one of {sorted(VALID_INIT_TRANSFORM_DIRECTIONS)}, "
+                    f"got '{dataset_config.init_transform_direction}'."
+                )
+            if (
+                not isinstance(dataset_config.init_transform_template, str)
+                or "{case_id}" not in dataset_config.init_transform_template
+            ):
+                raise ValueError(
+                    f"Dataset '{dataset_config.name}': '{DatasetKeys.INIT_TRANSFORM_TEMPLATE}' "
+                    f"must include '{{case_id}}'."
                 )
 
 

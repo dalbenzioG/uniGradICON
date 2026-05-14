@@ -198,6 +198,88 @@ def test_validate_warns_on_unknown_training_key(caplog):
     assert any("Unrecognized training keys" in r.message for r in caplog.records)
 
 
+def test_validate_warns_on_unknown_experiment_key(caplog):
+    import logging
+    cfg = _minimal_config()
+    cfg["experiment"]["some_typo_key"] = 42
+    with caplog.at_level(logging.WARNING):
+        config.validate_config(cfg)
+    assert any("Unrecognized experiment keys" in r.message for r in caplog.records)
+
+
+def test_validate_rejects_non_boolean_use_wandb():
+    cfg = _minimal_config()
+    cfg["experiment"]["use_wandb"] = "true"
+    with pytest.raises(ValueError, match="use_wandb"):
+        config.validate_config(cfg)
+
+
+@pytest.mark.parametrize("value", ["", "   ", 123, []])
+def test_validate_rejects_bad_wandb_project(value):
+    cfg = _minimal_config()
+    cfg["experiment"]["wandb_project"] = value
+    with pytest.raises(ValueError, match="wandb_project"):
+        config.validate_config(cfg)
+
+
+@pytest.mark.parametrize("key", ["wandb_entity", "wandb_run_name"])
+@pytest.mark.parametrize("value", ["", "   ", 123, []])
+def test_validate_rejects_bad_optional_wandb_text_values(key, value):
+    cfg = _minimal_config()
+    cfg["experiment"][key] = value
+    with pytest.raises(ValueError, match=key):
+        config.validate_config(cfg)
+
+
+def test_validate_accepts_wandb_experiment_keys():
+    cfg = _minimal_config()
+    cfg["experiment"].update({
+        "use_wandb": True,
+        "wandb_project": "unigradicon-finetune",
+        "wandb_entity": "my-team",
+        "wandb_run_name": "demo-run",
+    })
+    config.validate_config(cfg)
+
+
+def test_validate_accepts_init_transform_dataset_keys():
+    cfg = _minimal_config()
+    cfg["datasets"][0].update({
+        "type": "paired",
+        "init_transform_dir": "init_transf",
+        "init_transform_direction": "ct_to_us",
+        "init_transform_template": "{case_id}_CT_to_US_pca_icp.tfm",
+    })
+    config.validate_config(cfg)
+
+
+def test_validate_rejects_init_transform_for_unpaired_dataset():
+    cfg = _minimal_config()
+    cfg["datasets"][0]["init_transform_dir"] = "init_transf"
+    with pytest.raises(ValueError, match="requires dataset type 'paired'"):
+        config.validate_config(cfg)
+
+
+def test_validate_rejects_bad_init_transform_direction():
+    cfg = _minimal_config()
+    cfg["datasets"][0].update({
+        "type": "paired",
+        "init_transform_direction": "bad_direction",
+    })
+    with pytest.raises(ValueError, match="init_transform_direction"):
+        config.validate_config(cfg)
+
+
+def test_validate_rejects_template_without_case_id():
+    cfg = _minimal_config()
+    cfg["datasets"][0].update({
+        "type": "paired",
+        "init_transform_template": "no_placeholder.tfm",
+    })
+    with pytest.raises(ValueError, match="init_transform_template"):
+        config.validate_config(cfg)
+
+
 def _write_json(tmp_path, name, data):
     path = tmp_path / name
     with open(path, "w") as f:

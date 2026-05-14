@@ -4,13 +4,13 @@ Build a paired CT-US dataset JSON for uniGradICON finetuning (TRUSTED-style layo
 
 Scans CT and US directories, matches by (patient_id, side), and writes a JSON file
 with two entries per pair (one CT, one US). Optionally adds segmentation paths when
-files exist (e.g. *L_segCT.nii.gz, *L_segUS.nii.gz).
+files exist (e.g. *L_maskCT.nii.gz, *L_maskUS.nii.gz).
 
 Usage:
     python -m unigradicon.finetuning.scripts.build_trusted_pairs_json \\
         --data_path /path/to/trusted_code_nsd \\
-        --output trusted_pairs.json \\
-        [--ct_dir ...] [--us_dir ...] [--seg_suffix_ct _segCT] [--seg_suffix_us _segUS]
+        --output src/unigradicon/finetuning/configs/trusted_pairs.json \\
+        [--ct_dir ...] [--us_dir ...] [--seg_suffix_ct _maskCT] [--seg_suffix_us _maskUS]
 """
 
 import argparse
@@ -39,8 +39,8 @@ def extract_patient_side(filename: str) -> tuple:
 
 def find_segmentation_path(image_path: str, seg_suffix: str, seg_ext: str = ".nii.gz"):
     """
-    Given an image path like /dir/200L_imgCT.nii.gz and seg_suffix _segCT,
-    return /dir/200L_segCT.nii.gz if it exists, else None.
+    Given an image path like /dir/200L_imgCT.nii.gz and seg_suffix _maskCT,
+    return /dir/200L_maskCT.nii.gz if it exists, else None.
     """
     base = image_path.replace(".nii.gz", "").replace(".nii", "")
     # Replace _imgCT / _imgUS with the seg suffix
@@ -61,8 +61,8 @@ def find_segmentation_in_dir(
     """
     When segmentations live in a separate directory (e.g. CT_masks, US_masks),
     look for {patient_id}{side}{basename_suffix}.nii.gz in seg_dir.
-    e.g. image_path=.../200R_imgCT.nii.gz, seg_dir=.../CT_masks, basename_suffix=_seg
-    -> .../CT_masks/200R_seg.nii.gz
+    e.g. image_path=.../200R_imgCT.nii.gz, seg_dir=.../CT_masks, basename_suffix=_maskCT
+    -> .../CT_masks/200R_maskCT.nii.gz
     """
     pid, side = extract_patient_side(image_path)
     if pid is None or side is None:
@@ -86,7 +86,7 @@ def main():
         "--output",
         type=str,
         required=True,
-        help="Output JSON path (e.g. trusted_pairs.json).",
+        help="Output JSON path (e.g. src/unigradicon/finetuning/configs/trusted_pairs.json).",
     )
     parser.add_argument(
         "--ct_dir",
@@ -103,13 +103,13 @@ def main():
     parser.add_argument(
         "--seg_suffix_ct",
         type=str,
-        default="_segCT",
-        help="Suffix for CT segmentation filenames (e.g. 200L_imgCT.nii.gz -> 200L_segCT.nii.gz).",
+        default="_maskCT",
+        help="Suffix for CT segmentation filenames (e.g. 200L_imgCT.nii.gz -> 200L_maskCT.nii.gz).",
     )
     parser.add_argument(
         "--seg_suffix_us",
         type=str,
-        default="_segUS",
+        default="_maskUS",
         help="Suffix for US segmentation filenames (used only when seg is next to image).",
     )
     parser.add_argument(
@@ -127,8 +127,8 @@ def main():
     parser.add_argument(
         "--ct_seg_basename_suffix",
         type=str,
-        default="_seg",
-        help="Basename suffix for CT seg when using --ct_seg_dir (e.g. 200R -> 200R_seg.nii.gz). Default: _seg.",
+        default="_maskCT",
+        help="Basename suffix for CT seg when using --ct_seg_dir (e.g. 200R -> 200R_maskCT.nii.gz). Default: _maskCT.",
     )
     parser.add_argument(
         "--us_seg_basename_suffix",

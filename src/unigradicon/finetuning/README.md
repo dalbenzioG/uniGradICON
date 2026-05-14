@@ -107,6 +107,54 @@ unigradicon-finetune --config configs/learn2reg/l2r_abdomenmrct.yaml
 unigradicon-finetune --config configs/learn2reg/l2r_multi.yaml
 ```
 
+For TRUSTED-style CT-US paired training with segmentations:
+
+```bash
+# 1) Build/update the trusted pairs JSON
+python -m unigradicon.finetuning.scripts.build_trusted_pairs_json \
+  --data_path /path/to/TRUSTED \
+  --output src/unigradicon/finetuning/configs/trusted_pairs.json \
+  --require_segmentation
+
+# 2) Launch finetuning with the upstream-style examples config
+unigradicon-finetune --config configs/examples/config_trusted_ct_us_seg.yaml
+```
+
+### TRUSTED init-transform loading (`.tfm`)
+
+If CT and US are not initially coregistered, you can pass per-case initialization transforms so
+the loader resamples CT (and CT segmentations/masks) into US space before training.
+
+Expected layout (example):
+
+```
+TRUSTED/
+├── CT_images/
+├── CT_masks/
+├── US_images/    # or US_masks as fixed reference grid source for your transforms
+├── US_masks/
+└── init_transf/  # e.g. 200R_CT_to_US_pca_icp.tfm
+```
+
+Add these optional keys under the TRUSTED dataset entry:
+
+```yaml
+datasets:
+  - name: "trusted_ct_us_paired"
+    type: "paired"
+    json_file: "../../src/unigradicon/finetuning/configs/trusted_pairs.json"
+    init_transform_dir: "/absolute/or/relative/path/to/TRUSTED/init_transf"
+    init_transform_direction: "ct_to_us"
+    init_transform_template: "{case_id}_CT_to_US_pca_icp.tfm"
+```
+
+Directionality contract:
+- `ct_to_us`: transform maps CT physical coordinates -> US physical coordinates (moving=CT, fixed=US).
+- `us_to_ct`: transform maps US -> CT.
+
+`{case_id}` is derived from `subject_id` by removing underscores (e.g. `200_R` -> `200R`), so
+`subject_id` in your JSON and `.tfm` naming must be consistent.
+
 ### 6. Monitor and use results
 
 ```bash
@@ -147,6 +195,10 @@ Create a YAML file (e.g., `my_config.yaml`):
 experiment:
   name: "my_finetuning_experiment"
   model_weights: "unigradicon"  # Auto-downloads if not found
+  use_wandb: false  # Optional: enable Weights & Biases logging
+  wandb_project: "unigradicon-finetune"  # Required only when use_wandb: true
+  # wandb_entity: "my-team"   # Optional
+  # wandb_run_name: "my_finetuning_experiment"  # Optional (defaults to experiment.name)
 
 training:
   batch_size: 4
@@ -190,6 +242,16 @@ and mask overlay panels when mask data is available:
 # Footsteps stores runs in results/<experiment.name>/logs/<timestamp>
 tensorboard --logdir results/
 ```
+
+Optional: log the same scalars/panels to Weights & Biases:
+
+```bash
+pip install wandb
+wandb login
+```
+
+Then set `experiment.use_wandb: true` (and `experiment.wandb_project`) in your YAML config.
+If W&B is enabled but the package is not installed, finetuning exits early with an install hint.
 
 ### Step 5: Use Your Finetuned Model
 
@@ -250,6 +312,17 @@ unigradicon-register \
 | `mind_dilation` | int | Dilation for MIND-SSC similarity | 2 |
 | `samples_per_epoch` | int | Number of samples drawn per epoch (with replacement); null defaults to the combined dataset size | null |
 | `num_workers` | int | DataLoader worker processes | 4 |
+
+### Weights & Biases (Optional, Backward-Compatible Keys)
+
+Set these in the `experiment` section of the YAML:
+
+| Key | Type | Description | Default |
+|-----|------|-------------|---------|
+| `use_wandb` | bool | Enable W&B logging for train/val scalars and eval panels | false |
+| `wandb_project` | str | W&B project name (used when `use_wandb` is true) | `"unigradicon-finetune"` |
+| `wandb_entity` | str/null | W&B team/user | null |
+| `wandb_run_name` | str/null | Run display name | `experiment.name` |
 
 ### Input Shape Guidance
 
@@ -627,6 +700,11 @@ If `modality` is not specified for an entry, the dataset-level `is_ct` setting i
 ### "JSON file not found"
 - Verify the path resolves correctly. Relative paths in `json_file` are resolved against the YAML config file's directory, so a config at `configs/foo.yaml` referencing `data.json` looks for `configs/data.json`.
 - Use an absolute path if the config and data live in unrelated directories.
+
+### "transform file not found" (TRUSTED init transforms)
+- Check `init_transform_dir` and `init_transform_template` in your dataset config.
+- Confirm case naming: JSON `subject_id` like `200_R` maps to `{case_id}=200R`.
+- Verify direction (`init_transform_direction`) matches the transform you generated (`ct_to_us` vs `us_to_ct`).
 
 ### "must contain top-level 'data' key"
 - The JSON file is missing the wrapping `{"data": [...]}` object. Wrap your entry list under a `"data"` key.

@@ -1,6 +1,11 @@
 experiment:
   name: "multi_dataset_example"
   model_weights: "unigradicon"  # Auto-downloads pretrained weights; or set to a local path
+  # Optional W&B logging (backward-compatible keys):
+  # use_wandb: true
+  # wandb_project: "unigradicon-finetune"
+  # wandb_entity: "your-team"   # optional
+  # wandb_run_name: "multi_dataset_example"  # optional
 
 training:
   batch_size: 4

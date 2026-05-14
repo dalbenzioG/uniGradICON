@@ -1,6 +1,11 @@
 experiment:
   name: "example_seg_experiment"
   model_weights: "unigradicon"  # Auto-downloads pretrained weights; or set to a local path
+  # Optional W&B logging (backward-compatible keys):
+  # use_wandb: true
+  # wandb_project: "unigradicon-finetune"
+  # wandb_entity: "your-team"   # optional
+  # wandb_run_name: "example_seg_experiment"  # optional
 
 training:
   batch_size: 4

@@ -3,6 +3,10 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 MAX_DISPLAY_SAMPLES = 4
 DEFAULT_OVERLAY_ALPHA = 0.55
@@ -171,6 +175,7 @@ def add_eval_composite_panel(
     moving_mask: Optional[Tensor] = None,
     fixed_mask: Optional[Tensor] = None,
     tag: str = "eval",
+    use_wandb: bool = False,
 ) -> None:
     """Write a single composite eval panel under ``{tag}`` (default ``"eval"``).
 
@@ -209,3 +214,8 @@ def add_eval_composite_panel(
 
     composite = torch.cat(rows, dim=2)
     _add_images(writer, tag, composite, step)
+    if use_wandb and wandb is not None:
+        wandb.log(
+            {tag: [wandb.Image(composite[i]) for i in range(composite.shape[0])]},
+            step=step,
+        )

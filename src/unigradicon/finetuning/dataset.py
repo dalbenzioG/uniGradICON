@@ -19,6 +19,8 @@ import blosc
 blosc.set_nthreads(1)
 
 logger = logging.getLogger(__name__)
+DEFAULT_INIT_TRANSFORM_DIRECTION = "ct_to_us"
+DEFAULT_INIT_TRANSFORM_TEMPLATE = "{case_id}_CT_to_US_pca_icp.tfm"
 
 
 class Fields:
@@ -65,6 +67,9 @@ class DatasetParams:
     ct_window: Tuple[float, float] = (-1000, 1000)
     quantile_range: Tuple[float, float] = (0.0, 0.99)
     shuffle: bool = True
+    init_transform_dir: Optional[str] = None
+    init_transform_direction: str = DEFAULT_INIT_TRANSFORM_DIRECTION
+    init_transform_template: str = DEFAULT_INIT_TRANSFORM_TEMPLATE
 
 
 _DEFAULTS = DatasetParams()
@@ -156,6 +161,9 @@ class ImagePreprocessor:
 
     def preprocess_image(self, path: str) -> torch.Tensor:
         volume = self.reader.read(path)
+        return self.preprocess_image_tensor(volume, path)
+
+    def preprocess_image_tensor(self, volume: torch.Tensor, path: str) -> torch.Tensor:
         volume = volume[None, None].float()
         volume = torch.nn.functional.interpolate(
             volume, self.input_shape, mode="trilinear", align_corners=True
@@ -179,6 +187,9 @@ class ImagePreprocessor:
 
     def preprocess_label_map(self, path: str) -> torch.Tensor:
         label_map = self.reader.read(path)
+        return self.preprocess_label_map_tensor(label_map)
+
+    def preprocess_label_map_tensor(self, label_map: torch.Tensor) -> torch.Tensor:
         label_map = label_map[None, None].float()
         label_map = torch.nn.functional.interpolate(label_map, self.input_shape, mode="nearest")
         return label_map[0]
@@ -331,6 +342,9 @@ class Dataset(TorchDataset):
                  quantile_range: Tuple[float, float] = _DEFAULTS.quantile_range,
                  use_cache: bool = _DEFAULTS.use_cache,
                  use_compression: bool = _DEFAULTS.use_compression,
+                 init_transform_dir: Optional[str] = _DEFAULTS.init_transform_dir,
+                 init_transform_direction: str = _DEFAULTS.init_transform_direction,
+                 init_transform_template: str = _DEFAULTS.init_transform_template,
                  use_label: bool = False):
 
         self.name = name
@@ -340,8 +354,23 @@ class Dataset(TorchDataset):
         self.quantile_range = tuple(quantile_range)
         self.use_compression = use_compression
         self.use_label = use_label
+        self.init_transform_dir = (
+            os.path.abspath(init_transform_dir) if init_transform_dir else None
+        )
+        self.init_transform_direction = init_transform_direction
+        self.init_transform_template = init_transform_template
+        self._sitk = None
+        if self.init_transform_dir is not None:
+            expected_hint = "CT_to_US" if self.init_transform_direction == "ct_to_us" else "US_to_CT"
+            if expected_hint not in self.init_transform_template:
+                logger.warning(
+                    f"Dataset '{self.name}': init_transform_direction={self.init_transform_direction} "
+                    f"but init_transform_template='{self.init_transform_template}' does not contain "
+                    f"'{expected_hint}'. Verify transform directionality."
+                )
 
         self._build_entries_and_field_maps(data)
+        self._build_subject_pair_paths()
         self._build_preprocessor()
         self._initialize_cache(cache_dir, use_cache, maximum_images)
 
@@ -377,11 +406,15 @@ class Dataset(TorchDataset):
         ]
         self._segmentation_map = _build_required_field_map(self.entries, Fields.SEGMENTATION, self.name)
         self._mask_map = _build_required_field_map(self.entries, Fields.MASK, self.name)
+        self._entry_by_image = {entry.image: entry for entry in self.entries}
 
+        self._modality_name_map: Dict[str, str] = {}
         self._modality_map: Dict[str, bool] = {}
         for entry in self.entries:
             if entry.modality is not None:
-                self._modality_map[entry.image] = entry.modality.lower() == 'ct'
+                modality_name = entry.modality.lower()
+                self._modality_name_map[entry.image] = modality_name
+                self._modality_map[entry.image] = modality_name == 'ct'
         self._modality_hash = _stable_hash(self._modality_map)
 
         if self._modality_map and len(self._modality_map) < len(data):
@@ -392,6 +425,125 @@ class Dataset(TorchDataset):
                 f"and will fall back to the dataset-level is_ct={self.is_ct} ({fallback} preprocessing). "
                 f"First entry without modality: {missing[0]}."
             )
+
+    def _build_subject_pair_paths(self) -> None:
+        self._subject_pair_paths: Dict[str, Dict[str, str]] = {}
+        if self.init_transform_dir is None:
+            return
+
+        grouped = collections.defaultdict(dict)
+        for entry in self.entries:
+            modality = (entry.modality or "").lower()
+            if modality not in ("ct", "us"):
+                continue
+            if not entry.subject_id:
+                continue
+            grouped[entry.subject_id][modality] = entry.image
+
+        for subject_id, modalities in grouped.items():
+            if "ct" in modalities and "us" in modalities:
+                self._subject_pair_paths[subject_id] = {"ct": modalities["ct"], "us": modalities["us"]}
+
+    def _subject_to_case_id(self, subject_id: str) -> str:
+        return subject_id.replace("_", "")
+
+    def _resolve_transform_path(self, subject_id: str) -> str:
+        if self.init_transform_dir is None:
+            raise RuntimeError(
+                f"Dataset '{self.name}': transform path requested while init_transform_dir is not configured."
+            )
+        case_id = self._subject_to_case_id(subject_id)
+        filename = self.init_transform_template.format(case_id=case_id, subject_id=subject_id)
+        return os.path.join(self.init_transform_dir, filename)
+
+    def _get_sitk(self):
+        if self._sitk is None:
+            try:
+                import SimpleITK as sitk
+            except ImportError as exc:
+                raise ImportError(
+                    f"Dataset '{self.name}': transform-based resampling requires SimpleITK. "
+                    f"Install with `pip install SimpleITK` or disable init_transform_dir."
+                ) from exc
+            self._sitk = sitk
+        return self._sitk
+
+    def _sitk_image_to_tensor_ras(self, image: Any) -> torch.Tensor:
+        sitk = self._get_sitk()
+        try:
+            image = sitk.DICOMOrient(image, "RAS")
+        except Exception:
+            pass
+        array = sitk.GetArrayFromImage(image)
+        return torch.from_numpy(np.asarray(array))
+
+    def _resample_moving_to_fixed(self, moving: Any, fixed: Any, tx_moving_to_fixed: Any, interpolator: int) -> Any:
+        sitk = self._get_sitk()
+        tx_fixed_to_moving = tx_moving_to_fixed.GetInverse()
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetReferenceImage(fixed)
+        resampler.SetTransform(tx_fixed_to_moving)
+        resampler.SetInterpolator(interpolator)
+        resampler.SetDefaultPixelValue(0.0)
+        return resampler.Execute(moving)
+
+    def _load_transformed_tensor(
+        self,
+        source_path: str,
+        image_path: str,
+        is_label_map: bool,
+    ) -> Optional[torch.Tensor]:
+        if self.init_transform_dir is None:
+            return None
+        entry = self._entry_by_image.get(image_path)
+        if entry is None or not entry.subject_id:
+            raise ValueError(
+                f"Dataset '{self.name}': entry '{image_path}' is missing subject_id required for transform lookup."
+            )
+        modality = (entry.modality or "").lower()
+        if modality not in ("ct", "us"):
+            raise ValueError(
+                f"Dataset '{self.name}': entry '{image_path}' has modality '{entry.modality}'. "
+                f"Expected 'ct' or 'us' when init_transform_dir is set."
+            )
+
+        subject_paths = self._subject_pair_paths.get(entry.subject_id)
+        if not subject_paths:
+            raise ValueError(
+                f"Dataset '{self.name}': no CT/US pair found for subject_id '{entry.subject_id}' "
+                f"while init_transform_dir is set."
+            )
+
+        direction = self.init_transform_direction
+        should_transform = (
+            (direction == "ct_to_us" and modality == "ct")
+            or (direction == "us_to_ct" and modality == "us")
+        )
+        if not should_transform:
+            return None
+
+        sitk = self._get_sitk()
+        transform_path = self._resolve_transform_path(entry.subject_id)
+        if not os.path.exists(transform_path):
+            raise FileNotFoundError(
+                f"Dataset '{self.name}': transform file not found for subject_id '{entry.subject_id}': "
+                f"{transform_path}"
+            )
+        transform = sitk.ReadTransform(transform_path)
+
+        moving_path = source_path
+        fixed_modality = "us" if direction == "ct_to_us" else "ct"
+        fixed_path = subject_paths[fixed_modality]
+        moving = sitk.ReadImage(moving_path)
+        fixed = sitk.ReadImage(fixed_path)
+        interpolator = sitk.sitkNearestNeighbor if is_label_map else sitk.sitkLinear
+        resampled = self._resample_moving_to_fixed(
+            moving=moving,
+            fixed=fixed,
+            tx_moving_to_fixed=transform,
+            interpolator=interpolator,
+        )
+        return self._sitk_image_to_tensor_ras(resampled)
 
     def _build_preprocessor(self) -> None:
         self.reader = ImageReader()
@@ -420,6 +572,9 @@ class Dataset(TorchDataset):
             "maximum_images": maximum_images,
             "use_compression": self.use_compression,
             "data_fingerprint": self._data_fingerprint,
+            "init_transform_dir": self.init_transform_dir,
+            "init_transform_direction": self.init_transform_direction,
+            "init_transform_template": self.init_transform_template,
         }
         cache_signature = _stable_hash(cache_params)
         self.cache = DatasetCache(self.name, cache_dir, use_cache, cache_signature)
@@ -491,7 +646,16 @@ class Dataset(TorchDataset):
                 failures.append((path, f"missing '{field_name}' path"))
                 continue
             try:
-                self.store[path][field_name] = self._compress(self.preprocessor.preprocess_label_map(label_path))
+                transformed = self._load_transformed_tensor(
+                    source_path=label_path,
+                    image_path=path,
+                    is_label_map=True,
+                )
+                if transformed is not None:
+                    label_tensor = self.preprocessor.preprocess_label_map_tensor(transformed)
+                else:
+                    label_tensor = self.preprocessor.preprocess_label_map(label_path)
+                self.store[path][field_name] = self._compress(label_tensor)
             except Exception as e:
                 logger.warning(
                     f"Dataset '{self.name}': failed to preprocess {field_name} map "
@@ -516,7 +680,16 @@ class Dataset(TorchDataset):
         failures = []
         for path in tqdm(paths, desc=f"Loading images for '{self.name}'"):
             try:
-                self.store[path] = {Fields.IMAGE: self._compress(self.preprocessor.preprocess_image(path))}
+                transformed = self._load_transformed_tensor(
+                    source_path=path,
+                    image_path=path,
+                    is_label_map=False,
+                )
+                if transformed is not None:
+                    image_tensor = self.preprocessor.preprocess_image_tensor(transformed, path)
+                else:
+                    image_tensor = self.preprocessor.preprocess_image(path)
+                self.store[path] = {Fields.IMAGE: self._compress(image_tensor)}
             except Exception as e:
                 logger.warning(
                     f"Dataset '{self.name}': failed to load image '{path}': {e}."
@@ -524,6 +697,11 @@ class Dataset(TorchDataset):
                 failures.append((path, e))
 
         if failures:
+            if self.init_transform_dir is not None:
+                raise RuntimeError(
+                    f"Dataset '{self.name}': transform-aware loading failed for {len(failures)}/{len(paths)} "
+                    f"image(s). First failure: '{failures[0][0]}': {failures[0][1]}"
+                )
             failed = len(failures)
             total = len(paths)
             if failed == total and cached_count == 0:

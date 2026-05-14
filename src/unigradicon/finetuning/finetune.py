@@ -22,6 +22,7 @@ from .config import (
     TrainingConfig,
     TrainingKeys,
     set_reproducibility_seed,
+    DEFAULT_WANDB_PROJECT,
 )
 from .dataset import Fields, PairKeys
 from .visualization import add_eval_composite_panel
@@ -200,6 +201,18 @@ def _log_loss_scalars(writer: SummaryWriter, prefix: str, loss_dict: Dict[str, f
         writer.add_scalar(f"{prefix}/{key}", value, iteration)
 
 
+def _log_loss_scalars_with_wandb(
+    writer: SummaryWriter,
+    prefix: str,
+    loss_dict: Dict[str, float],
+    iteration: int,
+    use_wandb: bool,
+) -> None:
+    _log_loss_scalars(writer, prefix, loss_dict, iteration)
+    if use_wandb:
+        wandb.log({f"{prefix}/{key}": value for key, value in loss_dict.items()}, step=iteration)
+
+
 def _apply_roi_masking(batch: Dict[str, torch.Tensor]) -> None:
     """Zero out background under the ROI mask. Applied to both training and
     validation batches so the network sees the same input distribution in
@@ -243,6 +256,7 @@ def _run_validation(
     settings: TrainingConfig,
     data_fields: FrozenSet[str],
     device: torch.device,
+    use_wandb: bool,
 ) -> None:
     if not val_data_loaders_dict:
         return
@@ -259,7 +273,13 @@ def _run_validation(
                 _apply_roi_masking(val_batch)
             forward_kwargs = _build_forward_kwargs(val_batch, settings, data_fields)
             val_loss = net(val_batch[PairKeys.IMAGE_A], val_batch[PairKeys.IMAGE_B], **forward_kwargs)
-            _log_loss_scalars(writer, f"val/{ds_name}", loss_to_dict(val_loss), iteration)
+            _log_loss_scalars_with_wandb(
+                writer,
+                f"val/{ds_name}",
+                loss_to_dict(val_loss),
+                iteration,
+                use_wandb=use_wandb,
+            )
             _write_eval_visualizations(
                 writer,
                 iteration,
@@ -268,6 +288,7 @@ def _run_validation(
                 settings,
                 data_fields,
                 ds_name,
+                use_wandb=use_wandb,
             )
             net.clean()
     finally:
@@ -282,6 +303,7 @@ def _write_eval_visualizations(
     settings: TrainingConfig,
     data_fields: FrozenSet[str],
     ds_name: str,
+    use_wandb: bool,
 ) -> None:
     has_seg = Fields.SEGMENTATION in data_fields
     has_mask = Fields.MASK in data_fields
@@ -302,6 +324,7 @@ def _write_eval_visualizations(
         moving_mask=val_batch[PairKeys.MASK_A] if has_mask else None,
         fixed_mask=val_batch[PairKeys.MASK_B] if has_mask else None,
         tag=f"eval/{ds_name}",
+        use_wandb=use_wandb,
     )
 
 
@@ -328,6 +351,15 @@ def finetune_multi(
     schema = FinetuningConfigSchema.from_dict(config)
     settings = schema.training
     exp_config = config[ConfigSections.EXPERIMENT]
+    use_wandb = exp_config.get(ExperimentKeys.USE_WANDB, False)
+    wandb_project = exp_config.get(ExperimentKeys.WANDB_PROJECT, DEFAULT_WANDB_PROJECT)
+    wandb_entity = exp_config.get(ExperimentKeys.WANDB_ENTITY)
+    wandb_run_name = exp_config.get(ExperimentKeys.WANDB_RUN_NAME) or exp_config[ExperimentKeys.NAME]
+    if use_wandb and wandb is None:
+        raise ImportError(
+            "use_wandb is true but wandb is not installed. "
+            "Install with: pip install wandb. Or set use_wandb: false."
+        )
     device = icon_config.device
 
     if device.type == "cuda":
@@ -373,6 +405,19 @@ def finetune_multi(
         os.path.join(footsteps.output_dir, "logs", datetime.now().strftime("%Y%m%d-%H%M%S")),
         flush_secs=30,
     )
+    wandb_initialized = False
+    if use_wandb:
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=wandb_run_name,
+            config={
+                "experiment": dict(exp_config),
+                "training": config.get(ConfigSections.TRAINING, {}),
+                "datasets": config.get(ConfigSections.DATASETS, []),
+            },
+        )
+        wandb_initialized = True
 
     logger.info("Starting training loop.")
     logger.info(f"Auxiliary data fields: {sorted(data_fields) if data_fields else 'images only'}.")
@@ -401,7 +446,13 @@ def finetune_multi(
                     data_fields,
                     device,
                 )
-                _log_loss_scalars(writer, "train", loss_dict, iteration)
+                _log_loss_scalars_with_wandb(
+                    writer,
+                    "train",
+                    loss_dict,
+                    iteration,
+                    use_wandb=use_wandb,
+                )
 
                 if iteration % DEFAULT_LOG_PERIOD == 0:
                     loss_str = " | ".join([f"{k}={v:.4f}" for k, v in loss_dict.items()])
@@ -425,12 +476,15 @@ def finetune_multi(
                     settings,
                     data_fields,
                     device,
+                    use_wandb=use_wandb,
                 )
 
         _save_checkpoint(net, optimizer, footsteps.output_dir, "final")
         logger.info("Training loop completed; final checkpoint written.")
     finally:
         writer.close()
+        if wandb_initialized:
+            wandb.finish()
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -447,6 +501,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     config = load_config(args.config)
     validate_config(config)
     exp_config = config[ConfigSections.EXPERIMENT]
+    use_wandb = exp_config.get(ExperimentKeys.USE_WANDB, False)
+    if use_wandb and wandb is None:
+        raise ImportError(
+            "use_wandb is true but wandb is not installed. "
+            "Install with: pip install wandb. Or set use_wandb: false."
+        )
 
     seed = config.get(ConfigSections.TRAINING, {}).get(TrainingKeys.SEED)
     set_reproducibility_seed(seed)
