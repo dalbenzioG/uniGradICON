@@ -14,14 +14,48 @@ import icon_registration.networks as networks
 from icon_registration import config
 from icon_registration.mermaidlite import compute_warped_image_multiNC
 import icon_registration.itk_wrapper
+from .contrastive import (
+    DenseInfoNCELoss,
+    FrozenContrastiveFeatureExtractor,
+    resize_features_to_phi,
+)
+from .encoders import AutoEncoder, build_encoder_from_arch
 
 # Extended loss object that includes dice_loss for segmentation-based training
 ICONDiceLoss = namedtuple('ICONDiceLoss', ['all_loss', 'inverse_consistency_loss', 'similarity_loss', 'transform_magnitude', 'flips', 'dice_loss'])
+ICONDiceContrastiveLoss = namedtuple(
+    'ICONDiceContrastiveLoss',
+    [
+        'all_loss',
+        'inverse_consistency_loss',
+        'similarity_loss',
+        'transform_magnitude',
+        'flips',
+        'dice_loss',
+        'contrastive_loss',
+        'contrastive_weight',
+    ],
+)
 
 input_shape = [1, 1, 175, 175, 175]
 
 class GradientICONSparse(network_wrappers.RegistrationModule):
-    def __init__(self, network, similarity, lmbda, use_label=False, apply_intensity_conservation_loss=False, dice_loss_weight=0.0, loss_function_masking=False):
+    def __init__(
+        self,
+        network,
+        similarity,
+        lmbda,
+        use_label=False,
+        apply_intensity_conservation_loss=False,
+        dice_loss_weight=0.0,
+        loss_function_masking=False,
+        contrastive_loss_weight=0.0,
+        contrastive_feature_extractor=None,
+        contrastive_temperature=0.1,
+        contrastive_num_samples=2048,
+        contrastive_warmup_epochs=0,
+        use_contrastive_loss=False,
+    ):
         super().__init__()
 
         self.regis_net = network
@@ -31,8 +65,45 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
         self.use_label = use_label
         self.apply_intensity_conservation_loss = apply_intensity_conservation_loss
         self.loss_function_masking = loss_function_masking
+        self.contrastive_loss_weight = float(contrastive_loss_weight)
+        self.contrastive_feature_extractor = contrastive_feature_extractor
+        self.contrastive_temperature = float(contrastive_temperature)
+        self.contrastive_num_samples = int(contrastive_num_samples)
+        self.contrastive_warmup_epochs = int(contrastive_warmup_epochs)
+        self.use_contrastive_loss = bool(
+            use_contrastive_loss
+            or (
+                self.contrastive_feature_extractor is not None
+                and self.contrastive_loss_weight > 0.0
+            )
+        )
+        if self.use_contrastive_loss and self.contrastive_feature_extractor is None:
+            raise ValueError(
+                "contrastive_feature_extractor must be provided when contrastive loss is enabled."
+            )
+        self.contrastive_loss_fn = (
+            DenseInfoNCELoss(
+                temperature=self.contrastive_temperature,
+                num_samples=self.contrastive_num_samples,
+            )
+            if self.use_contrastive_loss
+            else None
+        )
 
-    def forward(self, image_A, image_B, label_A=None, label_B=None, mask_A=None, mask_B=None, segmentation_A=None, segmentation_B=None):
+    def forward(
+        self,
+        image_A,
+        image_B,
+        label_A=None,
+        label_B=None,
+        mask_A=None,
+        mask_B=None,
+        segmentation_A=None,
+        segmentation_B=None,
+        modality_A=None,
+        modality_B=None,
+        current_epoch=None,
+    ):
         assert self.identity_map.shape[2:] == image_A.shape[2:]
         assert self.identity_map.shape[2:] == image_B.shape[2:]
         if self.use_label:
@@ -227,12 +298,56 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
 
         inverse_consistency_loss = sum(direction_losses)
 
-        all_loss = self.lmbda * inverse_consistency_loss + similarity_loss + dice_loss * self.dice_loss_weight
+        contrastive_loss = torch.zeros((), dtype=image_A.dtype, device=image_A.device)
+        current_contrastive_weight = 0.0
+        if self.use_contrastive_loss:
+            if modality_A is None or modality_B is None:
+                raise ValueError(
+                    "modality_A and modality_B must be provided when contrastive loss is enabled."
+                )
+            contrastive_loss = self.compute_contrastive_registration_loss(
+                image_A=image_A,
+                image_B=image_B,
+                phi_AB_vectorfield=self.phi_AB_vectorfield,
+                phi_BA_vectorfield=self.phi_BA_vectorfield,
+                modality_A=modality_A,
+                modality_B=modality_B,
+                mask_A=mask_A,
+                mask_B=mask_B,
+            )
+            current_contrastive_weight = self._get_current_contrastive_weight(current_epoch)
+
+        all_loss = (
+            self.lmbda * inverse_consistency_loss
+            + similarity_loss
+            + dice_loss * self.dice_loss_weight
+            + contrastive_loss * current_contrastive_weight
+        )
 
         transform_magnitude = torch.mean(
             (self.identity_map - self.phi_AB_vectorfield) ** 2
         )
         
+        if self.use_contrastive_loss:
+            dice_value = (
+                dice_loss
+                if isinstance(dice_loss, torch.Tensor)
+                else torch.tensor(dice_loss, dtype=image_A.dtype, device=image_A.device)
+            )
+            return ICONDiceContrastiveLoss(
+                all_loss,
+                inverse_consistency_loss,
+                similarity_loss,
+                transform_magnitude,
+                icon.losses.flips(self.phi_BA_vectorfield),
+                dice_value,
+                contrastive_loss,
+                torch.tensor(
+                    current_contrastive_weight,
+                    dtype=image_A.dtype,
+                    device=image_A.device,
+                ),
+            )
         if self.dice_loss_weight > 0.0:
             return ICONDiceLoss(
                 all_loss,
@@ -250,6 +365,66 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
                 transform_magnitude,
                 icon.losses.flips(self.phi_BA_vectorfield),
             )
+
+    def _get_current_contrastive_weight(self, current_epoch):
+        if not self.use_contrastive_loss:
+            return 0.0
+        if self.contrastive_warmup_epochs <= 0:
+            return self.contrastive_loss_weight
+        if current_epoch is None:
+            return self.contrastive_loss_weight
+        warmup_factor = min(1.0, float(current_epoch) / float(self.contrastive_warmup_epochs))
+        return self.contrastive_loss_weight * warmup_factor
+
+    def _extract_batch_features(self, image, modalities):
+        if isinstance(modalities, str):
+            return self.contrastive_feature_extractor(image, modalities)
+        if len(modalities) != image.shape[0]:
+            raise ValueError(
+                f"Expected one modality per batch item, got batch={image.shape[0]} and modalities={len(modalities)}."
+            )
+        features = []
+        for idx, modality in enumerate(modalities):
+            features.append(self.contrastive_feature_extractor(image[idx:idx + 1], modality))
+        return torch.cat(features, dim=0)
+
+    def compute_contrastive_registration_loss(
+        self,
+        image_A,
+        image_B,
+        phi_AB_vectorfield,
+        phi_BA_vectorfield,
+        modality_A,
+        modality_B,
+        mask_A=None,
+        mask_B=None,
+    ):
+        if not self.use_contrastive_loss or self.contrastive_loss_fn is None:
+            return torch.zeros((), dtype=image_A.dtype, device=image_A.device)
+
+        z_A = self._extract_batch_features(image_A, modality_A)
+        z_B = self._extract_batch_features(image_B, modality_B)
+        z_A = resize_features_to_phi(z_A, phi_AB_vectorfield)
+        z_B = resize_features_to_phi(z_B, phi_BA_vectorfield)
+
+        z_A_warped = compute_warped_image_multiNC(
+            z_A,
+            phi_AB_vectorfield,
+            self.spacing,
+            1,
+            zero_boundary=True,
+        )
+        z_B_warped = compute_warped_image_multiNC(
+            z_B,
+            phi_BA_vectorfield,
+            self.spacing,
+            1,
+            zero_boundary=True,
+        )
+
+        loss_ctr_AB = self.contrastive_loss_fn(z_A_warped, z_B, mask_B)
+        loss_ctr_BA = self.contrastive_loss_fn(z_B_warped, z_A, mask_A)
+        return loss_ctr_AB + loss_ctr_BA
 
     def compute_jacobian_determinant(self, phi):
         if len(phi.size()) == 4:
@@ -321,7 +496,22 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
         if hasattr(self, 'warped_loss_input_B_jacob'):
             del self.warped_loss_input_B_jacob
 
-def make_network(input_shape, include_last_step=False, lmbda=1.5, loss_fn=icon.LNCC(sigma=5), use_label=False, apply_intensity_conservation_loss=False, dice_loss_weight=0.0, loss_function_masking=False):
+def make_network(
+    input_shape,
+    include_last_step=False,
+    lmbda=1.5,
+    loss_fn=icon.LNCC(sigma=5),
+    use_label=False,
+    apply_intensity_conservation_loss=False,
+    dice_loss_weight=0.0,
+    loss_function_masking=False,
+    contrastive_loss_weight=0.0,
+    contrastive_feature_extractor=None,
+    contrastive_temperature=0.1,
+    contrastive_num_samples=2048,
+    contrastive_warmup_epochs=0,
+    use_contrastive_loss=False,
+):
     dimension = len(input_shape) - 2
     inner_net = icon.FunctionFromVectorField(networks.tallUNet2(dimension=dimension))
 
@@ -333,7 +523,21 @@ def make_network(input_shape, include_last_step=False, lmbda=1.5, loss_fn=icon.L
     if include_last_step:
         inner_net = icon.TwoStepRegistration(inner_net, icon.FunctionFromVectorField(networks.tallUNet2(dimension=dimension)))
 
-    net = GradientICONSparse(inner_net, loss_fn, lmbda=lmbda, use_label=use_label, apply_intensity_conservation_loss=apply_intensity_conservation_loss, dice_loss_weight=dice_loss_weight, loss_function_masking=loss_function_masking)
+    net = GradientICONSparse(
+        inner_net,
+        loss_fn,
+        lmbda=lmbda,
+        use_label=use_label,
+        apply_intensity_conservation_loss=apply_intensity_conservation_loss,
+        dice_loss_weight=dice_loss_weight,
+        loss_function_masking=loss_function_masking,
+        contrastive_loss_weight=contrastive_loss_weight,
+        contrastive_feature_extractor=contrastive_feature_extractor,
+        contrastive_temperature=contrastive_temperature,
+        contrastive_num_samples=contrastive_num_samples,
+        contrastive_warmup_epochs=contrastive_warmup_epochs,
+        use_contrastive_loss=use_contrastive_loss,
+    )
     net.assign_identity_map(input_shape)
     return net
 
@@ -347,8 +551,33 @@ def make_sim(similarity, sigma=5, mind_radius=2, mind_dilation=2):
     else:
         raise ValueError(f"Similarity measure {similarity} not recognized. Choose from [lncc, lncc2, mind].")
 
-def get_multigradicon(loss_fn=icon.LNCC(sigma=5), apply_intensity_conservation_loss=False, weights_location=None, dice_loss_weight=0.0, loss_function_masking=False):
-    net = make_network(input_shape, include_last_step=True, loss_fn=loss_fn, apply_intensity_conservation_loss=apply_intensity_conservation_loss, dice_loss_weight=dice_loss_weight, loss_function_masking=loss_function_masking)
+def get_multigradicon(
+    loss_fn=icon.LNCC(sigma=5),
+    apply_intensity_conservation_loss=False,
+    weights_location=None,
+    dice_loss_weight=0.0,
+    loss_function_masking=False,
+    contrastive_loss_weight=0.0,
+    contrastive_feature_extractor=None,
+    contrastive_temperature=0.1,
+    contrastive_num_samples=2048,
+    contrastive_warmup_epochs=0,
+    use_contrastive_loss=False,
+):
+    net = make_network(
+        input_shape,
+        include_last_step=True,
+        loss_fn=loss_fn,
+        apply_intensity_conservation_loss=apply_intensity_conservation_loss,
+        dice_loss_weight=dice_loss_weight,
+        loss_function_masking=loss_function_masking,
+        contrastive_loss_weight=contrastive_loss_weight,
+        contrastive_feature_extractor=contrastive_feature_extractor,
+        contrastive_temperature=contrastive_temperature,
+        contrastive_num_samples=contrastive_num_samples,
+        contrastive_warmup_epochs=contrastive_warmup_epochs,
+        use_contrastive_loss=use_contrastive_loss,
+    )
     from os.path import exists
     if weights_location is None:
         weights_location = "network_weights/multigradicon1.0/Step_2_final.trch"
@@ -366,8 +595,33 @@ def get_multigradicon(loss_fn=icon.LNCC(sigma=5), apply_intensity_conservation_l
     net.eval()
     return net
 
-def get_unigradicon(loss_fn=icon.LNCC(sigma=5), apply_intensity_conservation_loss=False, weights_location=None, dice_loss_weight=0.0, loss_function_masking=False):
-    net = make_network(input_shape, include_last_step=True, loss_fn=loss_fn, apply_intensity_conservation_loss=apply_intensity_conservation_loss, dice_loss_weight=dice_loss_weight, loss_function_masking=loss_function_masking)
+def get_unigradicon(
+    loss_fn=icon.LNCC(sigma=5),
+    apply_intensity_conservation_loss=False,
+    weights_location=None,
+    dice_loss_weight=0.0,
+    loss_function_masking=False,
+    contrastive_loss_weight=0.0,
+    contrastive_feature_extractor=None,
+    contrastive_temperature=0.1,
+    contrastive_num_samples=2048,
+    contrastive_warmup_epochs=0,
+    use_contrastive_loss=False,
+):
+    net = make_network(
+        input_shape,
+        include_last_step=True,
+        loss_fn=loss_fn,
+        apply_intensity_conservation_loss=apply_intensity_conservation_loss,
+        dice_loss_weight=dice_loss_weight,
+        loss_function_masking=loss_function_masking,
+        contrastive_loss_weight=contrastive_loss_weight,
+        contrastive_feature_extractor=contrastive_feature_extractor,
+        contrastive_temperature=contrastive_temperature,
+        contrastive_num_samples=contrastive_num_samples,
+        contrastive_warmup_epochs=contrastive_warmup_epochs,
+        use_contrastive_loss=use_contrastive_loss,
+    )
     from os.path import exists
     if weights_location is None:
         weights_location = "network_weights/unigradicon1.0/Step_2_final.trch"
@@ -384,7 +638,20 @@ def get_unigradicon(loss_fn=icon.LNCC(sigma=5), apply_intensity_conservation_los
     net.eval()
     return net
 
-def get_model_from_model_zoo(model_name="unigradicon", loss_fn=icon.LNCC(sigma=5), apply_intensity_conservation_loss=False, dice_loss_weight=0.0, loss_function_masking=False, weights_location=None):
+def get_model_from_model_zoo(
+    model_name="unigradicon",
+    loss_fn=icon.LNCC(sigma=5),
+    apply_intensity_conservation_loss=False,
+    dice_loss_weight=0.0,
+    loss_function_masking=False,
+    weights_location=None,
+    contrastive_loss_weight=0.0,
+    contrastive_feature_extractor=None,
+    contrastive_temperature=0.1,
+    contrastive_num_samples=2048,
+    contrastive_warmup_epochs=0,
+    use_contrastive_loss=False,
+):
     if model_name == "unigradicon":
         return get_unigradicon(
             loss_fn,
@@ -392,6 +659,12 @@ def get_model_from_model_zoo(model_name="unigradicon", loss_fn=icon.LNCC(sigma=5
             weights_location=weights_location,
             dice_loss_weight=dice_loss_weight,
             loss_function_masking=loss_function_masking,
+            contrastive_loss_weight=contrastive_loss_weight,
+            contrastive_feature_extractor=contrastive_feature_extractor,
+            contrastive_temperature=contrastive_temperature,
+            contrastive_num_samples=contrastive_num_samples,
+            contrastive_warmup_epochs=contrastive_warmup_epochs,
+            use_contrastive_loss=use_contrastive_loss,
         )
     elif model_name == "multigradicon":
         return get_multigradicon(
@@ -400,6 +673,12 @@ def get_model_from_model_zoo(model_name="unigradicon", loss_fn=icon.LNCC(sigma=5
             weights_location=weights_location,
             dice_loss_weight=dice_loss_weight,
             loss_function_masking=loss_function_masking,
+            contrastive_loss_weight=contrastive_loss_weight,
+            contrastive_feature_extractor=contrastive_feature_extractor,
+            contrastive_temperature=contrastive_temperature,
+            contrastive_num_samples=contrastive_num_samples,
+            contrastive_warmup_epochs=contrastive_warmup_epochs,
+            use_contrastive_loss=use_contrastive_loss,
         )
     else:
         raise ValueError(f"Model {model_name} not recognized. Choose from [unigradicon, multigradicon].")

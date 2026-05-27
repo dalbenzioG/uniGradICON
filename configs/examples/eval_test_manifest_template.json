@@ -1,0 +1,29 @@
+{
+  "data": [
+    {
+      "case_id": "trusted_001",
+      "fixed": {
+        "image": "../../data/TRUSTED_reg/test/case001/US.nii.gz",
+        "modality": "us",
+        "segmentation": "../../data/TRUSTED_reg/test/case001/US_seg.nii.gz",
+        "mask": "../../data/TRUSTED_reg/test/case001/US_mask.nii.gz",
+        "landmarks": "../../data/TRUSTED_reg/test/case001/US_landmarks.txt"
+      },
+      "moving": {
+        "image": "../../data/TRUSTED_reg/test/case001/CT.nii.gz",
+        "modality": "ct",
+        "segmentation": "../../data/TRUSTED_reg/test/case001/CT_seg.nii.gz",
+        "mask": "../../data/TRUSTED_reg/test/case001/CT_mask.nii.gz",
+        "landmarks": "../../data/TRUSTED_reg/test/case001/CT_landmarks.txt"
+      },
+      "initial_transform": "../../data/TRUSTED_reg/test/case001/CT_to_US_init.tfm",
+      "metrics": {
+        "tre": true,
+        "chamfer": true,
+        "dice": true,
+        "mi": true,
+        "hd95": true
+      }
+    }
+  ]
+}

@@ -68,6 +68,15 @@ class TrainingKeys:
     MIND_DILATION = 'mind_dilation'
     SAMPLES_PER_EPOCH = 'samples_per_epoch'
     NUM_WORKERS = 'num_workers'
+    USE_CONTRASTIVE_LOSS = 'use_contrastive_loss'
+    CONTRASTIVE_LOSS_WEIGHT = 'contrastive_loss_weight'
+    CONTRASTIVE_TEMPERATURE = 'contrastive_temperature'
+    CONTRASTIVE_NUM_SAMPLES = 'contrastive_num_samples'
+    CONTRASTIVE_WARMUP_EPOCHS = 'contrastive_warmup_epochs'
+    CONTRASTIVE_FEATURE_LEVEL = 'contrastive_feature_level'
+    CONTRASTIVE_NORMALIZE_FEATURES = 'contrastive_normalize_features'
+    CONTRASTIVE_PREOP_ENCODER_CHECKPOINT = 'contrastive_preop_encoder_checkpoint'
+    CONTRASTIVE_US_ENCODER_CHECKPOINT = 'contrastive_us_encoder_checkpoint'
 
 
 class DatasetKeys:
@@ -179,6 +188,15 @@ class TrainingConfig:
     mind_radius: int = 2
     mind_dilation: int = 2
     dice_loss_weight: float = 0.0
+    use_contrastive_loss: bool = False
+    contrastive_loss_weight: float = 0.0
+    contrastive_temperature: float = 0.1
+    contrastive_num_samples: int = 2048
+    contrastive_warmup_epochs: int = 0
+    contrastive_feature_level: Optional[int] = None
+    contrastive_normalize_features: bool = True
+    contrastive_preop_encoder_checkpoint: Optional[str] = None
+    contrastive_us_encoder_checkpoint: Optional[str] = None
     loss_function_masking: bool = False
     roi_masking: bool = False
     seed: Optional[int] = None
@@ -318,7 +336,9 @@ class ConfigValidator:
                     f"(got {train_config[positive_key]})"
                 )
         for non_negative_key in (TrainingKeys.LAMBDA, TrainingKeys.DICE_LOSS_WEIGHT,
-                                 TrainingKeys.NUM_WORKERS):
+                                 TrainingKeys.NUM_WORKERS,
+                                 TrainingKeys.CONTRASTIVE_LOSS_WEIGHT,
+                                 TrainingKeys.CONTRASTIVE_WARMUP_EPOCHS):
             if non_negative_key in train_config and train_config[non_negative_key] < 0:
                 raise ValueError(
                     f"'{non_negative_key}' must be non-negative "
@@ -354,6 +374,36 @@ class ConfigValidator:
                     f"'{TrainingKeys.SIMILARITY}' must be one of "
                     f"{sorted(VALID_SIMILARITIES)}, got '{train_config[TrainingKeys.SIMILARITY]}'"
                 )
+        if (
+            TrainingKeys.CONTRASTIVE_TEMPERATURE in train_config
+            and train_config[TrainingKeys.CONTRASTIVE_TEMPERATURE] <= 0
+        ):
+            raise ValueError(
+                f"'{TrainingKeys.CONTRASTIVE_TEMPERATURE}' must be > 0 "
+                f"(got {train_config[TrainingKeys.CONTRASTIVE_TEMPERATURE]})"
+            )
+        if (
+            TrainingKeys.CONTRASTIVE_NUM_SAMPLES in train_config
+            and train_config[TrainingKeys.CONTRASTIVE_NUM_SAMPLES] <= 0
+        ):
+            raise ValueError(
+                f"'{TrainingKeys.CONTRASTIVE_NUM_SAMPLES}' must be > 0 "
+                f"(got {train_config[TrainingKeys.CONTRASTIVE_NUM_SAMPLES]})"
+            )
+        for bool_key in (
+            TrainingKeys.USE_CONTRASTIVE_LOSS,
+            TrainingKeys.CONTRASTIVE_NORMALIZE_FEATURES,
+        ):
+            if bool_key in train_config and not isinstance(train_config[bool_key], bool):
+                raise ValueError(f"'{bool_key}' must be a boolean")
+        if (
+            TrainingKeys.CONTRASTIVE_FEATURE_LEVEL in train_config
+            and train_config[TrainingKeys.CONTRASTIVE_FEATURE_LEVEL] is not None
+            and not isinstance(train_config[TrainingKeys.CONTRASTIVE_FEATURE_LEVEL], int)
+        ):
+            raise ValueError(
+                f"'{TrainingKeys.CONTRASTIVE_FEATURE_LEVEL}' must be an integer or null"
+            )
 
     def _validate_datasets(self) -> None:
         for idx, ds_config in enumerate(self.config[ConfigSections.DATASETS]):

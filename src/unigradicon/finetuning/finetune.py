@@ -24,6 +24,7 @@ from .config import (
     set_reproducibility_seed,
     DEFAULT_WANDB_PROJECT,
 )
+from ..encoders import build_encoder_from_arch
 from .dataset import Fields, PairKeys
 from .visualization import add_eval_composite_panel
 
@@ -125,6 +126,7 @@ def _load_network_weights(net: Any, model_weights: str, loss_fn: Any, settings: 
             loss_fn=loss_fn,
             dice_loss_weight=settings.dice_loss_weight,
             loss_function_masking=settings.loss_function_masking,
+            use_contrastive_loss=False,
         )
         # Explicit ``strict=True`` catches architecture drift between
         # ``make_network`` and ``get_model_from_model_zoo``.
@@ -178,10 +180,104 @@ def _build_optimizer(
     return optimizer
 
 
+DEFAULT_CONTRASTIVE_FEATURE_LEVEL = -2
+
+
+def _load_encoder_and_metadata_from_checkpoint(checkpoint_path: str):
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Encoder checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(
+            f"Malformed encoder checkpoint at {checkpoint_path}: expected a dict with keys "
+            "'arch', 'arch_kwargs', and 'state_dict'."
+        )
+
+    required = ("arch", "arch_kwargs", "state_dict")
+    missing = [key for key in required if key not in checkpoint]
+    if missing:
+        raise ValueError(
+            f"Malformed encoder checkpoint at {checkpoint_path}: missing required key(s) {missing}."
+        )
+
+    arch = checkpoint["arch"]
+    arch_kwargs = checkpoint["arch_kwargs"]
+    state_dict = checkpoint["state_dict"]
+    if not isinstance(arch, str):
+        raise ValueError(f"Checkpoint {checkpoint_path}: 'arch' must be a string.")
+    if not isinstance(arch_kwargs, dict):
+        raise ValueError(f"Checkpoint {checkpoint_path}: 'arch_kwargs' must be a dict.")
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Checkpoint {checkpoint_path}: 'state_dict' must be a dict.")
+
+    encoder = build_encoder_from_arch(arch, arch_kwargs)
+    try:
+        encoder.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Strict state_dict load failed for checkpoint {checkpoint_path} (arch={arch}): {exc}"
+        ) from exc
+
+    return encoder, checkpoint.get("feature_level")
+
+
+def _resolve_contrastive_feature_level(
+    settings: TrainingConfig,
+    preop_ckpt_feature_level: Any,
+    us_ckpt_feature_level: Any,
+) -> int:
+    if settings.contrastive_feature_level is not None:
+        return int(settings.contrastive_feature_level)
+
+    levels = [
+        int(level)
+        for level in (preop_ckpt_feature_level, us_ckpt_feature_level)
+        if level is not None
+    ]
+    if not levels:
+        return DEFAULT_CONTRASTIVE_FEATURE_LEVEL
+    if len(set(levels)) > 1:
+        raise ValueError(
+            "Preop and US encoder checkpoints specify different feature_level values. "
+            "Set training.contrastive_feature_level explicitly to override."
+        )
+    return levels[0]
+
+
+def _build_contrastive_feature_extractor(settings: TrainingConfig) -> Any:
+    if not settings.use_contrastive_loss:
+        return None
+    if not settings.contrastive_preop_encoder_checkpoint or not settings.contrastive_us_encoder_checkpoint:
+        raise ValueError(
+            "Contrastive loss is enabled but encoder checkpoints are missing. "
+            "Set both training.contrastive_preop_encoder_checkpoint and "
+            "training.contrastive_us_encoder_checkpoint."
+        )
+    preop_encoder, preop_feature_level = _load_encoder_and_metadata_from_checkpoint(
+        settings.contrastive_preop_encoder_checkpoint
+    )
+    us_encoder, us_feature_level = _load_encoder_and_metadata_from_checkpoint(
+        settings.contrastive_us_encoder_checkpoint
+    )
+    feature_level = _resolve_contrastive_feature_level(
+        settings,
+        preop_feature_level,
+        us_feature_level,
+    )
+    return unigradicon.FrozenContrastiveFeatureExtractor(
+        preop_encoder=preop_encoder,
+        us_encoder=us_encoder,
+        feature_level=feature_level,
+        normalize_features=settings.contrastive_normalize_features,
+    )
+
+
 def _build_forward_kwargs(
     batch: Dict[str, torch.Tensor],
     settings: TrainingConfig,
     data_fields: FrozenSet[str],
+    current_epoch: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     forward_kwargs = {}
     if settings.use_label and PairKeys.LABEL_A in batch:
@@ -193,6 +289,10 @@ def _build_forward_kwargs(
     if settings.loss_function_masking and Fields.MASK in data_fields:
         forward_kwargs[PairKeys.MASK_A] = batch[PairKeys.MASK_A]
         forward_kwargs[PairKeys.MASK_B] = batch[PairKeys.MASK_B]
+    if settings.use_contrastive_loss:
+        forward_kwargs[PairKeys.MODALITY_A] = batch[PairKeys.MODALITY_A]
+        forward_kwargs[PairKeys.MODALITY_B] = batch[PairKeys.MODALITY_B]
+        forward_kwargs["current_epoch"] = current_epoch
     return forward_kwargs
 
 
@@ -229,8 +329,9 @@ def _train_one_batch(
     settings: TrainingConfig,
     data_fields: FrozenSet[str],
     device: torch.device,
+    current_epoch: int,
 ) -> Dict[str, float]:
-    batch = {key: value.to(device) for key, value in batch.items()}
+    batch = {key: (value.to(device) if torch.is_tensor(value) else value) for key, value in batch.items()}
     with torch.no_grad():
         batch = augment(batch)
 
@@ -238,7 +339,7 @@ def _train_one_batch(
         _apply_roi_masking(batch)
 
     optimizer.zero_grad()
-    forward_kwargs = _build_forward_kwargs(batch, settings, data_fields)
+    forward_kwargs = _build_forward_kwargs(batch, settings, data_fields, current_epoch=current_epoch)
     loss_object = net_par(batch[PairKeys.IMAGE_A], batch[PairKeys.IMAGE_B], **forward_kwargs)
     loss = torch.mean(loss_object.all_loss)
     loss.backward()
@@ -257,6 +358,7 @@ def _run_validation(
     data_fields: FrozenSet[str],
     device: torch.device,
     use_wandb: bool,
+    current_epoch: int,
 ) -> None:
     if not val_data_loaders_dict:
         return
@@ -268,10 +370,15 @@ def _run_validation(
     try:
         with torch.no_grad():
             val_batch = next(iter(val_loader))
-            val_batch = {key: value.to(device) for key, value in val_batch.items()}
+            val_batch = {key: (value.to(device) if torch.is_tensor(value) else value) for key, value in val_batch.items()}
             if settings.roi_masking:
                 _apply_roi_masking(val_batch)
-            forward_kwargs = _build_forward_kwargs(val_batch, settings, data_fields)
+            forward_kwargs = _build_forward_kwargs(
+                val_batch,
+                settings,
+                data_fields,
+                current_epoch=current_epoch,
+            )
             val_loss = net(val_batch[PairKeys.IMAGE_A], val_batch[PairKeys.IMAGE_B], **forward_kwargs)
             _log_loss_scalars_with_wandb(
                 writer,
@@ -388,6 +495,12 @@ def finetune_multi(
         use_label=settings.use_label,
         dice_loss_weight=settings.dice_loss_weight,
         loss_function_masking=settings.loss_function_masking,
+        contrastive_loss_weight=settings.contrastive_loss_weight,
+        contrastive_feature_extractor=_build_contrastive_feature_extractor(settings),
+        contrastive_temperature=settings.contrastive_temperature,
+        contrastive_num_samples=settings.contrastive_num_samples,
+        contrastive_warmup_epochs=settings.contrastive_warmup_epochs,
+        use_contrastive_loss=settings.use_contrastive_loss,
     )
     model_weights = _load_network_weights(net, exp_config[ExperimentKeys.MODEL_WEIGHTS], loss_fn, settings)
 
@@ -428,6 +541,8 @@ def finetune_multi(
     logger.info(
         f"Loss configuration: similarity={settings.similarity}, lambda={settings.lmbda}, "
         f"dice_loss_weight={settings.dice_loss_weight}, "
+        f"use_contrastive_loss={settings.use_contrastive_loss}, "
+        f"contrastive_loss_weight={settings.contrastive_loss_weight}, "
         f"loss_function_masking={settings.loss_function_masking}, "
         f"roi_masking={settings.roi_masking}, use_label={settings.use_label}."
     )
@@ -445,6 +560,7 @@ def finetune_multi(
                     settings,
                     data_fields,
                     device,
+                    current_epoch=epoch,
                 )
                 _log_loss_scalars_with_wandb(
                     writer,
@@ -477,6 +593,7 @@ def finetune_multi(
                     data_fields,
                     device,
                     use_wandb=use_wandb,
+                    current_epoch=epoch,
                 )
 
         _save_checkpoint(net, optimizer, footsteps.output_dir, "final")

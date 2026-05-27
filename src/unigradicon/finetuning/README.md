@@ -116,8 +116,8 @@ python -m unigradicon.finetuning.scripts.build_trusted_pairs_json \
   --output src/unigradicon/finetuning/configs/trusted_pairs.json \
   --require_segmentation
 
-# 2) Launch finetuning with the upstream-style examples config
-unigradicon-finetune --config configs/examples/config_trusted_ct_us_seg.yaml
+# 2) Launch finetuning with the Trusted Kidney config
+unigradicon-finetune --config configs/trusted_kidney/config_trusted_ct_us_seg.yaml
 ```
 
 ### TRUSTED init-transform loading (`.tfm`)
@@ -304,6 +304,15 @@ unigradicon-register \
 | `lambda` | float | Regularization weight | 1.5 |
 | `similarity` | str | Loss function: "lncc", "lncc2", "mind" | "lncc" |
 | `dice_loss_weight` | float | Dice loss weight (requires `segmentation` in JSON) | 0.0 |
+| `use_contrastive_loss` | bool | Enable optional frozen-feature contrastive branch | false |
+| `contrastive_loss_weight` | float | Weight for contrastive loss term | 0.0 |
+| `contrastive_temperature` | float | InfoNCE temperature (>0) | 0.1 |
+| `contrastive_num_samples` | int | Sampled spatial points per item for contrastive loss (>0) | 2048 |
+| `contrastive_warmup_epochs` | int | Linear warmup epochs for contrastive weight | 0 |
+| `contrastive_feature_level` | int/null | Feature level index; null uses checkpoint `feature_level`, else fallback `-2` | null |
+| `contrastive_normalize_features` | bool | L2-normalize feature channels before contrastive loss | true |
+| `contrastive_preop_encoder_checkpoint` | str/null | Checkpoint for CT/MR(preop) frozen encoder module | null |
+| `contrastive_us_encoder_checkpoint` | str/null | Checkpoint for ultrasound frozen encoder module | null |
 | `loss_function_masking` | bool | Restrict similarity loss to masked regions (requires `mask` in JSON) | false |
 | `roi_masking` | bool | Crop images to ROI before registration (requires `mask` in JSON) | false |
 | `use_label` | bool | Label randomization for modality-invariant training (see below) | false |
@@ -452,7 +461,48 @@ training:
   dice_loss_weight: 0.5  # Requires 'segmentation' in JSON
 ```
 
-Total loss: `L_total = lambda * L_inverse_consistency + L_similarity + dice_loss_weight * L_dice`
+Total loss: `L_total = lambda * L_inverse_consistency + L_similarity + dice_loss_weight * L_dice + contrastive_loss_weight_current * L_contrastive`
+
+### Optional Frozen Contrastive Loss
+
+The contrastive branch is loss-side only: registration architecture stays unchanged. Features are extracted by frozen pretrained encoders under `torch.no_grad()`, then warped with the predicted deformation field so gradients still flow to registration parameters.
+
+```yaml
+training:
+  use_contrastive_loss: true
+  contrastive_loss_weight: 0.05
+  contrastive_temperature: 0.1
+  contrastive_num_samples: 2048
+  contrastive_warmup_epochs: 20
+  contrastive_feature_level: null  # optional override
+  contrastive_normalize_features: true
+  contrastive_preop_encoder_checkpoint: "/path/to/preop_encoder.ckpt"
+  contrastive_us_encoder_checkpoint: "/path/to/us_encoder.ckpt"
+```
+
+Checkpoint schema (required):
+
+```python
+{
+    "arch": "AutoEncoder3D",
+    "arch_kwargs": {
+        "in_channels": 1,
+        "base_channels": 32,
+        "feature_dim": 128
+    },
+    "state_dict": model.state_dict(),
+    "feature_level": -2,  # optional
+    "metadata": {...}     # optional
+}
+```
+
+Notes:
+- `modality` values from dataset JSON are forwarded per pair as `modality_A/B`.
+- Modalities in `ct/mri/mr/preop` route to preop encoder; `us/ultrasound` route to US encoder.
+- Encoders are reconstructed from checkpoint `arch` + `arch_kwargs` and loaded with `strict=True` state-dict matching.
+- With `contrastive_warmup_epochs > 0`, weight ramps linearly from 0 to `contrastive_loss_weight`.
+- `contrastive_feature_level` resolution order: config override -> checkpoint `feature_level` (must match across preop/US) -> default `-2`.
+- If disabled (`use_contrastive_loss: false` or weight `0.0`), baseline behavior is unchanged.
 
 ### Loss Function Masking
 
@@ -695,28 +745,4 @@ datasets:
 
 If `modality` is not specified for an entry, the dataset-level `is_ct` setting is used as the fallback.
 
-## Troubleshooting
 
-### "JSON file not found"
-- Verify the path resolves correctly. Relative paths in `json_file` are resolved against the YAML config file's directory, so a config at `configs/foo.yaml` referencing `data.json` looks for `configs/data.json`.
-- Use an absolute path if the config and data live in unrelated directories.
-
-### "transform file not found" (TRUSTED init transforms)
-- Check `init_transform_dir` and `init_transform_template` in your dataset config.
-- Confirm case naming: JSON `subject_id` like `200_R` maps to `{case_id}=200R`.
-- Verify direction (`init_transform_direction`) matches the transform you generated (`ct_to_us` vs `us_to_ct`).
-
-### "must contain top-level 'data' key"
-- The JSON file is missing the wrapping `{"data": [...]}` object. Wrap your entry list under a `"data"` key.
-
-### "'data' must be provided"
-- The JSON file's `data` list is empty after path resolution. Make sure at least one entry is present and that all `image` paths resolve to existing files.
-
-### Weights are relative
-- Sampler treats weights as relative multipliers; they do not need to sum to 1.0.
-- Keep weights positive to avoid invalid sampler behavior.
-
-### Cache takes too much disk space
-- Set `use_cache: false`.
-- Delete old caches: remove the signature subdirectory under your `cache_dir` (or `rm -rf results/<experiment>/<signature>/`). Each signature directory contains the `.trch` files plus its `_meta.json`.
-- Use `maximum_images` to limit dataset size.

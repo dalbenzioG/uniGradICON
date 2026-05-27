@@ -52,6 +52,8 @@ class PairKeys:
     MASK_B = "mask_B"
     LABEL_A = "label_A"
     LABEL_B = "label_B"
+    MODALITY_A = "modality_A"
+    MODALITY_B = "modality_B"
 
 
 @dataclass
@@ -740,6 +742,8 @@ class Dataset(TorchDataset):
         result = {
             PairKeys.IMAGE_A: self.get_image(key_a),
             PairKeys.IMAGE_B: self.get_image(key_b),
+            PairKeys.MODALITY_A: self._modality_name_map.get(key_a, "ct" if self.is_ct else "mri"),
+            PairKeys.MODALITY_B: self._modality_name_map.get(key_b, "ct" if self.is_ct else "mri"),
         }
         if self.has_segmentation:
             result[PairKeys.SEGMENTATION_A] = self._decompress(self.store[key_a][Fields.SEGMENTATION])

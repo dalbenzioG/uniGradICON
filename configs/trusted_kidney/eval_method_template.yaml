@@ -1,0 +1,43 @@
+method_name: "trusted_kidney_lncc"
+test_manifest: "eval_test_manifest_prealigned.json"
+
+# Model loading
+model: "multigradicon"  # one of: unigradicon, multigradicon
+# network_weights: "C:/path/to/network_weights_final.trch"
+
+# Inference setup (single method per run)
+io_iterations: 50
+io_lr: 0.00002
+io_sim: "lncc"  # one of: lncc, lncc2, mind
+dice_loss_weight: 0.0
+loss_function_masking: false
+input_masking: false
+intensity_conservation_loss: false
+
+# Optional preprocessing overrides
+# Match MultiGradICON finetuning defaults to reduce memory and align behavior.
+input_shape: [175, 175, 175]
+# ct_window: [-1000, 1000]
+# quantile_range: [0.0, 0.99]
+
+# Output and reliability settings
+output_root: "results/eval"
+metrics: ["tre", "chamfer", "dice", "mi", "hd95"]
+resume: true
+flush_every: 1
+save_transforms: true
+cache_preprocessed: true
+# If moving image/seg are already prealigned, set false to apply
+# initial_transform only for TRE landmarks (not image/seg/mask resampling).
+apply_initial_transform_to_images: true
+# Set false after aligning CT landmarks offline with scripts/align_eval_landmarks.py.
+apply_initial_transform_to_landmarks: false
+# Set true if your manifest .tfm is stored in fixed->moving direction but TRE
+# needs moving->fixed application on landmarks (only when landmark flag is true).
+invert_initial_transform_for_tre: false
+
+# Chamfer surface-point generation from fixed/moving segmentations
+chamfer_label_value: 1
+chamfer_max_surface_points: 5000
+chamfer_random_seed: 0
+chamfer_cache_surface_points: true

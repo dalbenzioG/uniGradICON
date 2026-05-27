@@ -1,0 +1,49 @@
+experiment:
+  name: "trusted_ct_us_seg"
+  model_weights: "multigradicon"
+  # Optional W&B logging (backward-compatible keys):
+  # use_wandb: true
+  # wandb_project: "unigradicon-finetune"
+  # wandb_entity: "your-team"   # optional
+  # wandb_run_name: "trusted_ct_us_seg"  # optional
+
+training:
+  batch_size: 2
+  gpus: [0]
+  epochs: 200
+  eval_period: 10
+  save_period: 50
+  learning_rate: 0.00005
+  input_shape: [175, 175, 175]
+  similarity: "lncc2"
+  lambda: 1.5
+  dice_loss_weight: 0.3
+  # Optional frozen contrastive feature loss branch (disabled by default)
+  use_contrastive_loss: false
+  contrastive_loss_weight: 0.0
+  contrastive_temperature: 0.1
+  contrastive_num_samples: 2048
+  contrastive_warmup_epochs: 20
+  # If null, uses checkpoint feature_level; falls back to -2 if absent.
+  contrastive_feature_level: null
+  contrastive_normalize_features: true
+  # Required when use_contrastive_loss is true.
+  # Checkpoint format must be:
+  # { "arch": "AutoEncoder3D", "arch_kwargs": {...}, "state_dict": ..., "feature_level": -2 }
+  # contrastive_preop_encoder_checkpoint: "/path/to/preop_encoder.ckpt"
+  # contrastive_us_encoder_checkpoint: "/path/to/us_encoder.ckpt"
+  lncc_sigma: 5
+
+datasets:
+  - name: "trusted_ct_us_paired"
+    type: "paired"
+    # Keep backward compatibility with your existing JSON location.
+    json_file: "../../src/unigradicon/finetuning/configs/trusted_pairs.json"
+    # Optional online init-transform loading (CT->US) from TRUSTED init_transf folder:
+    # init_transform_dir: "../../../../../kidney_dataset/TRUSTED/init_transf"
+    # init_transform_direction: "ct_to_us"
+    # init_transform_template: "{case_id}_CT_to_US_pca_icp.tfm"
+    weight: 1.0
+    is_ct: false
+    quantile_range: [0.0, 0.99]
+    ct_window: [-1000, 1000]

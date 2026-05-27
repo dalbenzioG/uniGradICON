@@ -1,0 +1,37 @@
+method_name: "fine_tuned_lncc"
+test_manifest: "eval_test_manifest_template.json"
+
+# Model loading
+model: "multigradicon"  # one of: unigradicon, multigradicon
+# network_weights: "results/my_run/checkpoints/network_weights_final.trch"
+
+# Inference setup (single method per run)
+io_iterations: 50
+io_lr: 0.00002
+io_sim: "lncc"  # one of: lncc, lncc2, mind
+dice_loss_weight: 0.0
+loss_function_masking: false
+input_masking: false
+intensity_conservation_loss: false
+
+# Optional preprocessing overrides
+# ct_window: [-1000, 1000]
+# quantile_range: [0.0, 0.99]
+
+# Output and reliability settings
+output_root: "results/eval"
+metrics: ["tre", "chamfer", "dice", "mi", "hd95"]
+resume: true
+flush_every: 1
+save_transforms: true
+cache_preprocessed: true
+# If moving image/seg are already prealigned, set false to apply
+# initial_transform only for TRE landmarks (not image/seg/mask resampling).
+apply_initial_transform_to_images: true
+apply_initial_transform_to_landmarks: true
+
+# Chamfer surface-point generation from fixed/moving segmentations
+chamfer_label_value: 1
+chamfer_max_surface_points: 5000
+chamfer_random_seed: 0
+chamfer_cache_surface_points: true
