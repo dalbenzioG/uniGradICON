@@ -1,0 +1,44 @@
+experiment:
+  name: "trusted_ct_us_seg"
+  model_weights: "C:/Users/gabridal/Documents/TRUSTED_reg/weights/Step_2_final.trch"
+  # Optional W&B logging (backward-compatible keys):
+  use_wandb: true
+  wandb_project: "multigradicon-finetune"
+  wandb_entity: null
+  wandb_run_name: "trusted_ct_us_finetuning_200epochs_contrastive"
+
+training:
+  batch_size: 1
+  gpus: [0]
+  epochs: 200
+  eval_period: 10
+  save_period: 50
+  learning_rate: 0.00005
+  input_shape: [175, 175, 175]
+  similarity: "mind"
+  mind_radius: 2          # optional (default 2)
+  mind_dilation: 2        # optional (default 2)
+  lambda: 1.5
+  dice_loss_weight: 0.3
+  contrareg_enabled: true
+  contrareg_weight: 0.01
+  contrareg_num_patches: 512
+  contrareg_temperature: 0.07
+  contrareg_embed_dim: 256
+  contrareg_feature_channels: [32, 64, 128]
+  contrareg_bidirectional: false
+  use_contrastive_loss: false  # required — mutually exclusive with dense InfoNCE
+  contrareg_fixed_ae_checkpoint: "results/encoder_pretrain/us_encoder.ckpt"   # encoder for IMAGE_B (fixed)
+  contrareg_moving_ae_checkpoint: "results/encoder_pretrain/preop_encoder.ckpt"  # encoder for IMAGE_A (moving/preop)
+
+datasets:
+  - name: "kidney_ct_us_paired"
+    type: "paired"
+    json_file: "kidney_finetuning_pairs.json"
+    use_cache: false
+    weight: 1.0
+    is_ct: false
+    quantile_range: [0.005, 0.995]
+    ct_window: [-1000, 1000]
+
+

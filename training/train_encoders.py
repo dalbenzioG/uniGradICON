@@ -9,7 +9,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from unigradicon.encoders import AutoEncoder
+import unigradicon
+from unigradicon.encoder_losses import autoencoder_reconstruction_loss
+from unigradicon.encoders import build_encoder_from_arch
 from unigradicon.finetuning.dataset import ImagePreprocessor, ImageReader
 
 
@@ -19,6 +21,7 @@ class EncoderTrainConfig:
     json_file: str
     modalities: Sequence[str]
     checkpoint_name: str
+    alpha_ncc: float = 1.0
 
 
 class JsonAutoEncoderDataset(Dataset):
@@ -101,16 +104,20 @@ def train_single_encoder(
         pin_memory=torch.cuda.is_available(),
     )
 
-    model = AutoEncoder(
-        in_channels=args.in_channels,
-        base_channels=args.base_channels,
-        feature_dim=args.feature_dim,
-    ).to(device)
+    arch_kwargs = {
+        "in_channels": args.in_channels,
+        "base_channels": args.base_channels,
+        "feature_dim": args.feature_dim,
+    }
+    model = build_encoder_from_arch(args.arch, arch_kwargs).to(device)
+    lncc_fn = unigradicon.make_sim("lncc", sigma=args.lncc_sigma)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
     model.train()
     for epoch in range(args.epochs):
-        running = 0.0
+        running_total = 0.0
+        running_recon = 0.0
+        running_lncc = 0.0
         for batch in tqdm(loader, desc=f"{cfg.name} epoch {epoch + 1}/{args.epochs}"):
             batch = batch.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
@@ -122,26 +129,35 @@ def train_single_encoder(
                     mode="trilinear",
                     align_corners=True,
                 )
-            if args.loss == "mse":
-                loss = F.mse_loss(reconstruction, batch)
-            else:
-                loss = F.l1_loss(reconstruction, batch)
+
+            loss, recon_loss, lncc_loss = autoencoder_reconstruction_loss(
+                batch,
+                reconstruction,
+                alpha_ncc=cfg.alpha_ncc,
+                lncc_fn=lncc_fn,
+                loss_type=args.loss,
+                return_components=True,
+            )
+
             loss.backward()
             optimizer.step()
-            running += float(loss.detach().cpu())
+            running_total += float(loss.detach().cpu())
+            running_recon += float(recon_loss.detach().cpu())
+            running_lncc += float(lncc_loss.detach().cpu())
 
-        mean_loss = running / max(len(loader), 1)
-        print(f"[{cfg.name}] epoch={epoch + 1}/{args.epochs} loss={mean_loss:.6f}")
+        n_batches = max(len(loader), 1)
+        print(
+            f"[{cfg.name}] epoch={epoch + 1}/{args.epochs} "
+            f"loss={running_total / n_batches:.6f} "
+            f"recon={running_recon / n_batches:.6f} "
+            f"lncc={running_lncc / n_batches:.6f}"
+        )
 
     os.makedirs(args.output_dir, exist_ok=True)
     checkpoint_path = os.path.join(args.output_dir, cfg.checkpoint_name)
     checkpoint = {
-        "arch": "AutoEncoder3D",
-        "arch_kwargs": {
-            "in_channels": args.in_channels,
-            "base_channels": args.base_channels,
-            "feature_dim": args.feature_dim,
-        },
+        "arch": args.arch,
+        "arch_kwargs": arch_kwargs,
         "state_dict": model.state_dict(),
         "feature_level": args.feature_level,
         "metadata": {
@@ -155,6 +171,8 @@ def train_single_encoder(
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
             "loss": args.loss,
+            "alpha_ncc": cfg.alpha_ncc,
+            "lncc_sigma": args.lncc_sigma,
         },
     }
     torch.save(checkpoint, checkpoint_path)
@@ -180,10 +198,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--loss", type=str, choices=["l1", "mse"], default="l1")
 
+    parser.add_argument("--arch", type=str, default="AutoEncoder3D")
     parser.add_argument("--in_channels", type=int, default=1)
     parser.add_argument("--base_channels", type=int, default=32)
     parser.add_argument("--feature_dim", type=int, default=128)
     parser.add_argument("--feature_level", type=int, default=-2)
+
+    parser.add_argument("--alpha_ncc_preop", type=float, default=1.0)
+    parser.add_argument("--alpha_ncc_us", type=float, default=0.5)
+    parser.add_argument("--lncc_sigma", type=int, default=5)
 
     parser.add_argument("--input_shape", type=int, nargs=3, default=[175, 175, 175])
     parser.add_argument("--ct_window", type=float, nargs=2, default=[-1000.0, 1000.0])
@@ -220,12 +243,14 @@ def main() -> None:
         json_file=args.preop_json,
         modalities=[m.strip().lower() for m in args.preop_modalities.split(",") if m.strip()],
         checkpoint_name="preop_encoder.ckpt",
+        alpha_ncc=args.alpha_ncc_preop,
     )
     us_cfg = EncoderTrainConfig(
         name="us_encoder",
         json_file=args.us_json,
         modalities=[m.strip().lower() for m in args.us_modalities.split(",") if m.strip()],
         checkpoint_name="us_encoder.ckpt",
+        alpha_ncc=args.alpha_ncc_us,
     )
 
     preop_path = train_single_encoder(preop_cfg, args, device)

@@ -77,6 +77,16 @@ class TrainingKeys:
     CONTRASTIVE_NORMALIZE_FEATURES = 'contrastive_normalize_features'
     CONTRASTIVE_PREOP_ENCODER_CHECKPOINT = 'contrastive_preop_encoder_checkpoint'
     CONTRASTIVE_US_ENCODER_CHECKPOINT = 'contrastive_us_encoder_checkpoint'
+    CONTRAREG_ENABLED = 'contrareg_enabled'
+    CONTRAREG_WEIGHT = 'contrareg_weight'
+    CONTRAREG_NUM_PATCHES = 'contrareg_num_patches'
+    CONTRAREG_TEMPERATURE = 'contrareg_temperature'
+    CONTRAREG_EMBED_DIM = 'contrareg_embed_dim'
+    CONTRAREG_FEATURE_CHANNELS = 'contrareg_feature_channels'
+    CONTRAREG_BIDIRECTIONAL = 'contrareg_bidirectional'
+    CONTRAREG_FIXED_AE_CHECKPOINT = 'contrareg_fixed_ae_checkpoint'
+    CONTRAREG_MOVING_AE_CHECKPOINT = 'contrareg_moving_ae_checkpoint'
+    STAGE_EPOCHS = 'stage_epochs'
 
 
 class DatasetKeys:
@@ -125,6 +135,7 @@ DEFAULT_DROP_LAST = True
 DEFAULT_PIN_MEMORY = True
 DEFAULT_SAMPLER_REPLACEMENT = True
 DEFAULT_WANDB_PROJECT = "unigradicon-finetune"
+DEFAULT_TRAIN_WANDB_PROJECT = "multigradicon-train"
 
 
 def _schema_kwargs(raw: Dict[str, Any], schema_cls, aliases: Dict[str, str]) -> Dict[str, Any]:
@@ -151,7 +162,7 @@ def _yaml_keys_for_dataclass(schema_cls, aliases: Dict[str, str]) -> set:
 @dataclass
 class ExperimentConfig:
     name: str
-    model_weights: str
+    model_weights: Optional[str] = None
     use_wandb: bool = False
     wandb_project: str = DEFAULT_WANDB_PROJECT
     wandb_entity: Optional[str] = None
@@ -162,7 +173,7 @@ class ExperimentConfig:
         kwargs = _schema_kwargs(raw, cls, {})
         return cls(
             name=kwargs[ExperimentKeys.NAME],
-            model_weights=kwargs[ExperimentKeys.MODEL_WEIGHTS],
+            model_weights=kwargs.get(ExperimentKeys.MODEL_WEIGHTS),
             use_wandb=kwargs.get(ExperimentKeys.USE_WANDB, False),
             wandb_project=kwargs.get(ExperimentKeys.WANDB_PROJECT, DEFAULT_WANDB_PROJECT),
             wandb_entity=kwargs.get(ExperimentKeys.WANDB_ENTITY),
@@ -197,9 +208,19 @@ class TrainingConfig:
     contrastive_normalize_features: bool = True
     contrastive_preop_encoder_checkpoint: Optional[str] = None
     contrastive_us_encoder_checkpoint: Optional[str] = None
+    contrareg_enabled: bool = False
+    contrareg_weight: float = 0.01
+    contrareg_num_patches: int = 512
+    contrareg_temperature: float = 0.07
+    contrareg_embed_dim: int = 256
+    contrareg_feature_channels: List[int] = field(default_factory=lambda: [32, 64, 128])
+    contrareg_bidirectional: bool = False
+    contrareg_fixed_ae_checkpoint: Optional[str] = None
+    contrareg_moving_ae_checkpoint: Optional[str] = None
     loss_function_masking: bool = False
     roi_masking: bool = False
     seed: Optional[int] = None
+    stage_epochs: Optional[List[int]] = None
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "TrainingConfig":
@@ -208,6 +229,10 @@ class TrainingConfig:
             kwargs["gpus"] = list(kwargs["gpus"])
         if "input_shape" in kwargs:
             kwargs["input_shape"] = list(kwargs["input_shape"])
+        if "contrareg_feature_channels" in kwargs:
+            kwargs["contrareg_feature_channels"] = list(kwargs["contrareg_feature_channels"])
+        if "stage_epochs" in kwargs:
+            kwargs["stage_epochs"] = list(kwargs["stage_epochs"])
         return cls(**kwargs)
 
     @property
@@ -338,7 +363,8 @@ class ConfigValidator:
         for non_negative_key in (TrainingKeys.LAMBDA, TrainingKeys.DICE_LOSS_WEIGHT,
                                  TrainingKeys.NUM_WORKERS,
                                  TrainingKeys.CONTRASTIVE_LOSS_WEIGHT,
-                                 TrainingKeys.CONTRASTIVE_WARMUP_EPOCHS):
+                                 TrainingKeys.CONTRASTIVE_WARMUP_EPOCHS,
+                                 TrainingKeys.CONTRAREG_WEIGHT):
             if non_negative_key in train_config and train_config[non_negative_key] < 0:
                 raise ValueError(
                     f"'{non_negative_key}' must be non-negative "
@@ -393,6 +419,8 @@ class ConfigValidator:
         for bool_key in (
             TrainingKeys.USE_CONTRASTIVE_LOSS,
             TrainingKeys.CONTRASTIVE_NORMALIZE_FEATURES,
+            TrainingKeys.CONTRAREG_ENABLED,
+            TrainingKeys.CONTRAREG_BIDIRECTIONAL,
         ):
             if bool_key in train_config and not isinstance(train_config[bool_key], bool):
                 raise ValueError(f"'{bool_key}' must be a boolean")
@@ -404,6 +432,62 @@ class ConfigValidator:
             raise ValueError(
                 f"'{TrainingKeys.CONTRASTIVE_FEATURE_LEVEL}' must be an integer or null"
             )
+        if (
+            TrainingKeys.CONTRAREG_TEMPERATURE in train_config
+            and train_config[TrainingKeys.CONTRAREG_TEMPERATURE] <= 0
+        ):
+            raise ValueError(
+                f"'{TrainingKeys.CONTRAREG_TEMPERATURE}' must be > 0 "
+                f"(got {train_config[TrainingKeys.CONTRAREG_TEMPERATURE]})"
+            )
+        if (
+            TrainingKeys.CONTRAREG_NUM_PATCHES in train_config
+            and train_config[TrainingKeys.CONTRAREG_NUM_PATCHES] <= 0
+        ):
+            raise ValueError(
+                f"'{TrainingKeys.CONTRAREG_NUM_PATCHES}' must be > 0 "
+                f"(got {train_config[TrainingKeys.CONTRAREG_NUM_PATCHES]})"
+            )
+        if (
+            TrainingKeys.CONTRAREG_EMBED_DIM in train_config
+            and train_config[TrainingKeys.CONTRAREG_EMBED_DIM] <= 0
+        ):
+            raise ValueError(
+                f"'{TrainingKeys.CONTRAREG_EMBED_DIM}' must be > 0 "
+                f"(got {train_config[TrainingKeys.CONTRAREG_EMBED_DIM]})"
+            )
+        if TrainingKeys.CONTRAREG_FEATURE_CHANNELS in train_config:
+            channels = train_config[TrainingKeys.CONTRAREG_FEATURE_CHANNELS]
+            if not (
+                isinstance(channels, (list, tuple))
+                and len(channels) == 3
+                and all(isinstance(c, int) and c > 0 for c in channels)
+            ):
+                raise ValueError(
+                    f"'{TrainingKeys.CONTRAREG_FEATURE_CHANNELS}' must be a length-3 list of "
+                    f"positive integers (got {channels})"
+                )
+        contrareg_enabled = train_config.get(TrainingKeys.CONTRAREG_ENABLED, False)
+        use_contrastive = train_config.get(TrainingKeys.USE_CONTRASTIVE_LOSS, False)
+        if contrareg_enabled and use_contrastive:
+            raise ValueError(
+                "ContraReg patch NCE (contrareg_enabled=true) and dense contrastive loss "
+                "(use_contrastive_loss=true) cannot both be enabled. Disable one of them."
+            )
+        if contrareg_enabled:
+            for ckpt_key in (
+                TrainingKeys.CONTRAREG_FIXED_AE_CHECKPOINT,
+                TrainingKeys.CONTRAREG_MOVING_AE_CHECKPOINT,
+            ):
+                ckpt_path = train_config.get(ckpt_key)
+                if not ckpt_path:
+                    raise ValueError(
+                        f"'{ckpt_key}' must be set when contrareg_enabled is true."
+                    )
+                if not os.path.exists(ckpt_path):
+                    raise ValueError(
+                        f"ContraReg encoder checkpoint not found: {ckpt_path}"
+                    )
 
     def _validate_datasets(self) -> None:
         for idx, ds_config in enumerate(self.config[ConfigSections.DATASETS]):
@@ -458,6 +542,71 @@ class ConfigValidator:
 
 def validate_config(config: Dict[str, Any]) -> None:
     ConfigValidator(config).validate()
+
+
+class ScratchTrainingConfigValidator(ConfigValidator):
+    """Validation for ``unigradicon-train`` from-scratch configs.
+
+    Unlike finetuning, ``experiment.model_weights`` is not required and
+    ``training.stage_epochs`` must be exactly two positive integers.
+    """
+
+    def validate(self) -> None:
+        self._validate_required_sections()
+        self._validate_experiment_scratch()
+        self._validate_training()
+        self._validate_stage_epochs()
+        self._validate_datasets()
+
+    def _validate_experiment_scratch(self) -> None:
+        exp = self.config[ConfigSections.EXPERIMENT]
+        if ExperimentKeys.NAME not in exp:
+            raise ValueError(f"Missing required experiment key: '{ExperimentKeys.NAME}'")
+        if ExperimentKeys.MODEL_WEIGHTS in exp:
+            logger.warning(
+                "'model_weights' is ignored for scratch training (random initialization)."
+            )
+        unknown = set(exp.keys()) - VALID_EXPERIMENT_KEYS
+        if unknown:
+            logger.warning(f"Unrecognized experiment keys (possible typos): {sorted(unknown)}.")
+
+        if ExperimentKeys.USE_WANDB in exp and not isinstance(exp[ExperimentKeys.USE_WANDB], bool):
+            raise ValueError(f"'{ExperimentKeys.USE_WANDB}' must be a boolean")
+
+        if ExperimentKeys.WANDB_PROJECT in exp:
+            project = exp[ExperimentKeys.WANDB_PROJECT]
+            if not isinstance(project, str) or not project.strip():
+                raise ValueError(f"'{ExperimentKeys.WANDB_PROJECT}' must be a non-empty string")
+
+        for optional_text_key in (ExperimentKeys.WANDB_ENTITY, ExperimentKeys.WANDB_RUN_NAME):
+            if optional_text_key in exp and exp[optional_text_key] is not None:
+                value = exp[optional_text_key]
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"'{optional_text_key}' must be a non-empty string or null")
+
+    def _validate_stage_epochs(self) -> None:
+        train_config = self.config.get(ConfigSections.TRAINING)
+        if train_config is None:
+            raise ValueError("Config must contain 'training' section with 'stage_epochs'")
+        stage_epochs = train_config.get(TrainingKeys.STAGE_EPOCHS)
+        if stage_epochs is None:
+            raise ValueError(
+                f"Scratch training requires '{TrainingKeys.STAGE_EPOCHS}' "
+                f"(two positive integers: [stage1_epochs, stage2_epochs])"
+            )
+        if not (
+            isinstance(stage_epochs, (list, tuple))
+            and len(stage_epochs) == 2
+            and all(isinstance(e, int) and e > 0 for e in stage_epochs)
+        ):
+            raise ValueError(
+                f"'{TrainingKeys.STAGE_EPOCHS}' must be a list of exactly two "
+                f"positive integers (got {stage_epochs})"
+            )
+
+
+def validate_scratch_training_config(config: Dict[str, Any]) -> None:
+    ScratchTrainingConfigValidator(config).validate()
 
 
 def load_config(config_path: str) -> Dict[str, Any]:
@@ -808,6 +957,55 @@ def create_data_loaders(config_path: str, config: Optional[Dict[str, Any]] = Non
         f"samples_per_epoch={samples_per_epoch}, "
         f"effective_batch={schema.training.batch_size}x{len(schema.training.gpus)} GPU(s), "
         f"iterations_per_epoch={iterations_per_epoch}."
+    )
+
+    return DataLoaderBundle(
+        train_loader=train_loader,
+        val_loaders=val_loaders,
+        config=config,
+        data_fields=data_fields,
+    )
+
+
+def _prepare_scratch_config(
+    config_path: str, config: Optional[Dict[str, Any]]
+) -> Tuple[Dict[str, Any], str, FinetuningConfigSchema]:
+    if config is None:
+        config = load_config(config_path)
+    validate_scratch_training_config(config)
+    prepared_config = copy.deepcopy(config)
+    schema = FinetuningConfigSchema.from_dict(prepared_config)
+    config_dir = os.path.dirname(os.path.abspath(config_path))
+    return prepared_config, config_dir, schema
+
+
+def create_scratch_data_loaders(
+    config_path: str, config: Optional[Dict[str, Any]] = None
+) -> DataLoaderBundle:
+    """Like ``create_data_loaders`` but for ``unigradicon-train`` scratch configs."""
+    config, config_dir, schema = _prepare_scratch_config(config_path, config)
+    json_cache = DatasetJsonCache()
+    data_fields = _validate_data_requirements(schema, config_dir, json_cache)
+
+    datasets, weights, val_loaders = _build_datasets_and_val_loaders(
+        schema.datasets,
+        tuple(schema.training.input_shape),
+        config_dir,
+        schema.training.use_label,
+        data_fields,
+        json_cache,
+    )
+
+    train_loader, total_samples, samples_per_epoch, iterations_per_epoch = _create_train_loader(
+        datasets, weights, schema.training,
+    )
+
+    logger.info(
+        f"Scratch training loader ready: total_samples={total_samples}, "
+        f"samples_per_epoch={samples_per_epoch}, "
+        f"effective_batch={schema.training.batch_size}x{len(schema.training.gpus)} GPU(s), "
+        f"iterations_per_epoch={iterations_per_epoch}, "
+        f"stage_epochs={schema.training.stage_epochs}."
     )
 
     return DataLoaderBundle(

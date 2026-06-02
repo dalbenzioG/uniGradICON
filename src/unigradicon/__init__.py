@@ -19,7 +19,9 @@ from .contrastive import (
     FrozenContrastiveFeatureExtractor,
     resize_features_to_phi,
 )
+from .contrareg import FrozenContraRegEncoderPair
 from .encoders import AutoEncoder, build_encoder_from_arch
+from .patch_contrastive import PatchProjector3D, multi_scale_patch_nce_loss
 
 # Extended loss object that includes dice_loss for segmentation-based training
 ICONDiceLoss = namedtuple('ICONDiceLoss', ['all_loss', 'inverse_consistency_loss', 'similarity_loss', 'transform_magnitude', 'flips', 'dice_loss'])
@@ -34,6 +36,20 @@ ICONDiceContrastiveLoss = namedtuple(
         'dice_loss',
         'contrastive_loss',
         'contrastive_weight',
+    ],
+)
+ICONDiceContraRegLoss = namedtuple(
+    'ICONDiceContraRegLoss',
+    [
+        'all_loss',
+        'registration_loss',
+        'inverse_consistency_loss',
+        'similarity_loss',
+        'transform_magnitude',
+        'flips',
+        'dice_loss',
+        'contrareg_loss',
+        'contrareg_weight',
     ],
 )
 
@@ -55,6 +71,14 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
         contrastive_num_samples=2048,
         contrastive_warmup_epochs=0,
         use_contrastive_loss=False,
+        contrareg_enabled=False,
+        contrareg_weight=0.01,
+        contrareg_num_patches=512,
+        contrareg_temperature=0.07,
+        contrareg_bidirectional=False,
+        contrareg_encoder_pair=None,
+        projector_fixed=None,
+        projector_moving=None,
     ):
         super().__init__()
 
@@ -89,6 +113,25 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
             if self.use_contrastive_loss
             else None
         )
+
+        self.contrareg_enabled = bool(contrareg_enabled)
+        self.contrareg_weight = float(contrareg_weight)
+        self.contrareg_num_patches = int(contrareg_num_patches)
+        self.contrareg_temperature = float(contrareg_temperature)
+        self.contrareg_bidirectional = bool(contrareg_bidirectional)
+        if self.contrareg_enabled:
+            if contrareg_encoder_pair is None or projector_fixed is None or projector_moving is None:
+                raise ValueError(
+                    "contrareg_encoder_pair, projector_fixed, and projector_moving must be "
+                    "provided when ContraReg is enabled."
+                )
+            self.contrareg_encoder_pair = contrareg_encoder_pair
+            self.projector_fixed = projector_fixed
+            self.projector_moving = projector_moving
+        else:
+            self.contrareg_encoder_pair = None
+            self.projector_fixed = None
+            self.projector_moving = None
 
     def forward(
         self,
@@ -317,23 +360,47 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
             )
             current_contrastive_weight = self._get_current_contrastive_weight(current_epoch)
 
-        all_loss = (
+        registration_loss = (
             self.lmbda * inverse_consistency_loss
             + similarity_loss
             + dice_loss * self.dice_loss_weight
             + contrastive_loss * current_contrastive_weight
         )
 
+        contrareg_loss = torch.zeros((), dtype=image_A.dtype, device=image_A.device)
+        if self.contrareg_enabled:
+            contrareg_loss = self.compute_contrareg_loss(image_B, self.warped_image_A)
+
+        all_loss = registration_loss + self.contrareg_weight * contrareg_loss
+
         transform_magnitude = torch.mean(
             (self.identity_map - self.phi_AB_vectorfield) ** 2
         )
+
+        dice_value = (
+            dice_loss
+            if isinstance(dice_loss, torch.Tensor)
+            else torch.tensor(dice_loss, dtype=image_A.dtype, device=image_A.device)
+        )
+
+        if self.contrareg_enabled:
+            return ICONDiceContraRegLoss(
+                all_loss,
+                registration_loss,
+                inverse_consistency_loss,
+                similarity_loss,
+                transform_magnitude,
+                icon.losses.flips(self.phi_BA_vectorfield),
+                dice_value,
+                contrareg_loss,
+                torch.tensor(
+                    self.contrareg_weight,
+                    dtype=image_A.dtype,
+                    device=image_A.device,
+                ),
+            )
         
         if self.use_contrastive_loss:
-            dice_value = (
-                dice_loss
-                if isinstance(dice_loss, torch.Tensor)
-                else torch.tensor(dice_loss, dtype=image_A.dtype, device=image_A.device)
-            )
             return ICONDiceContrastiveLoss(
                 all_loss,
                 inverse_consistency_loss,
@@ -355,7 +422,7 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
                 similarity_loss,
                 transform_magnitude,
                 icon.losses.flips(self.phi_BA_vectorfield),
-                dice_loss if isinstance(dice_loss, torch.Tensor) else torch.tensor(dice_loss),
+                dice_value,
             )
         else:
             return icon.losses.ICONLoss(
@@ -425,6 +492,41 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
         loss_ctr_AB = self.contrastive_loss_fn(z_A_warped, z_B, mask_B)
         loss_ctr_BA = self.contrastive_loss_fn(z_B_warped, z_A, mask_A)
         return loss_ctr_AB + loss_ctr_BA
+
+    def compute_contrareg_loss(self, fixed, warped_moving):
+        if not self.contrareg_enabled or self.contrareg_encoder_pair is None:
+            return torch.zeros((), dtype=fixed.dtype, device=fixed.device)
+
+        fixed_features = self.contrareg_encoder_pair.encode_fixed(fixed)
+        moving_features = self.contrareg_encoder_pair.encode_moving(warped_moving)
+
+        fixed_proj, patch_ids = self.projector_fixed(
+            fixed_features,
+            num_patches=self.contrareg_num_patches,
+        )
+        moving_proj, _ = self.projector_moving(
+            moving_features,
+            num_patches=self.contrareg_num_patches,
+            patch_ids=patch_ids,
+        )
+
+        batch_size = fixed.shape[0]
+        loss = multi_scale_patch_nce_loss(
+            fixed_proj,
+            moving_proj,
+            batch_size=batch_size,
+            num_patches=self.contrareg_num_patches,
+            temperature=self.contrareg_temperature,
+        )
+        if self.contrareg_bidirectional:
+            loss = loss + multi_scale_patch_nce_loss(
+                moving_proj,
+                fixed_proj,
+                batch_size=batch_size,
+                num_patches=self.contrareg_num_patches,
+                temperature=self.contrareg_temperature,
+            )
+        return loss
 
     def compute_jacobian_determinant(self, phi):
         if len(phi.size()) == 4:
@@ -511,6 +613,14 @@ def make_network(
     contrastive_num_samples=2048,
     contrastive_warmup_epochs=0,
     use_contrastive_loss=False,
+    contrareg_enabled=False,
+    contrareg_weight=0.01,
+    contrareg_num_patches=512,
+    contrareg_temperature=0.07,
+    contrareg_bidirectional=False,
+    contrareg_encoder_pair=None,
+    projector_fixed=None,
+    projector_moving=None,
 ):
     dimension = len(input_shape) - 2
     inner_net = icon.FunctionFromVectorField(networks.tallUNet2(dimension=dimension))
@@ -537,6 +647,14 @@ def make_network(
         contrastive_num_samples=contrastive_num_samples,
         contrastive_warmup_epochs=contrastive_warmup_epochs,
         use_contrastive_loss=use_contrastive_loss,
+        contrareg_enabled=contrareg_enabled,
+        contrareg_weight=contrareg_weight,
+        contrareg_num_patches=contrareg_num_patches,
+        contrareg_temperature=contrareg_temperature,
+        contrareg_bidirectional=contrareg_bidirectional,
+        contrareg_encoder_pair=contrareg_encoder_pair,
+        projector_fixed=projector_fixed,
+        projector_moving=projector_moving,
     )
     net.assign_identity_map(input_shape)
     return net

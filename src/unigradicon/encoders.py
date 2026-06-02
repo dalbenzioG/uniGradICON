@@ -1,3 +1,11 @@
+"""ContraReg-style 3D convolutional autoencoders for contrastive registration.
+
+Each encoder exposes ``encode(x) -> [conv1, conv2, conv3]`` and
+``forward(x) -> (reconstruction, features)``. Contrastive finetuning reads
+features at ``feature_level`` (default ``-2``, i.e. 64 channels when
+``base_channels=32``).
+"""
+
 from typing import Callable, Dict, Optional
 
 import torch.nn as nn

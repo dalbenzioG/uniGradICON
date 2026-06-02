@@ -1,4 +1,5 @@
 import logging
+import builtins
 import os
 import random
 import footsteps
@@ -25,6 +26,8 @@ from .config import (
     DEFAULT_WANDB_PROJECT,
 )
 from ..encoders import build_encoder_from_arch
+from ..contrareg import FrozenContraRegEncoderPair, contrareg_config_snapshot
+from ..patch_contrastive import PatchProjector3D
 from .dataset import Fields, PairKeys
 from .visualization import add_eval_composite_panel
 
@@ -33,11 +36,33 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_DIR = "checkpoints"
 NETWORK_WEIGHTS_PREFIX = "network_weights"
 OPTIMIZER_WEIGHTS_PREFIX = "optimizer_weights"
+CONTRAREG_WEIGHTS_PREFIX = "contrareg_weights"
 DEFAULT_LOG_PERIOD = 10
 
 
 def loss_to_dict(loss_object: Any) -> Dict[str, float]:
     return to_floats(loss_object)._asdict()
+
+
+def _initialize_footsteps(run_name: str, output_root: str = "results/") -> None:
+    """Initialize footsteps; use UTF-8 when writing info.txt on Windows.
+
+    footsteps records ``git diff`` in info.txt using the default locale encoding.
+    Uncommitted diffs with non-ASCII characters (e.g. arrows in comments) raise
+    UnicodeEncodeError on Windows cp1252 without an explicit encoding.
+    """
+    real_open = builtins.open
+
+    def _open_utf8(file, mode="r", *args, **kwargs):
+        if "b" not in mode and "encoding" not in kwargs:
+            kwargs["encoding"] = "utf-8"
+        return real_open(file, mode, *args, **kwargs)
+
+    builtins.open = _open_utf8
+    try:
+        footsteps.initialize(run_name=run_name, output_root=output_root)
+    finally:
+        builtins.open = real_open
 
 
 def _affine_warp(image: torch.Tensor, forward: torch.Tensor, mode: str = "bilinear") -> torch.Tensor:
@@ -96,7 +121,13 @@ def augment(batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return result
 
 
-def _save_checkpoint(net: Any, optimizer: torch.optim.Optimizer, output_dir: str, epoch: Any) -> None:
+def _save_checkpoint(
+    net: Any,
+    optimizer: torch.optim.Optimizer,
+    output_dir: str,
+    epoch: Any,
+    settings: Optional[TrainingConfig] = None,
+) -> None:
     torch.save(
         net.regis_net.state_dict(),
         os.path.join(output_dir, CHECKPOINT_DIR, f"{NETWORK_WEIGHTS_PREFIX}_{epoch}.trch"),
@@ -105,6 +136,15 @@ def _save_checkpoint(net: Any, optimizer: torch.optim.Optimizer, output_dir: str
         optimizer.state_dict(),
         os.path.join(output_dir, CHECKPOINT_DIR, f"{OPTIMIZER_WEIGHTS_PREFIX}_{epoch}.trch"),
     )
+    if settings is not None and settings.contrareg_enabled and net.projector_fixed is not None:
+        torch.save(
+            {
+                "projector_fixed": net.projector_fixed.state_dict(),
+                "projector_moving": net.projector_moving.state_dict(),
+                "contrareg_config": contrareg_config_snapshot(settings),
+            },
+            os.path.join(output_dir, CHECKPOINT_DIR, f"{CONTRAREG_WEIGHTS_PREFIX}_{epoch}.trch"),
+        )
 
 
 def _load_network_weights(net: Any, model_weights: str, loss_fn: Any, settings: TrainingConfig) -> Optional[str]:
@@ -158,15 +198,21 @@ def _build_optimizer(
     net: Any,
     learning_rate: float,
     model_weights: Optional[str],
+    contrareg_enabled: bool = False,
 ) -> torch.optim.Optimizer:
     """Build the Adam optimizer over the registration network parameters.
 
     Uses ``net.regis_net.parameters()`` so that the optimizer is bound to the
     same module whose ``state_dict`` is saved/loaded for checkpoints. This keeps
     parameter ordering stable regardless of whether the network is wrapped in
-    DataParallel, which makes single-GPU ↔ multi-GPU resumes safe.
+    DataParallel, which makes single-GPU <-> multi-GPU resumes safe.
     """
-    optimizer = torch.optim.Adam(net.regis_net.parameters(), lr=learning_rate)
+    param_groups = list(net.regis_net.parameters())
+    if contrareg_enabled:
+        param_groups = list(param_groups) + list(net.projector_fixed.parameters()) + list(
+            net.projector_moving.parameters()
+        )
+    optimizer = torch.optim.Adam(param_groups, lr=learning_rate)
     if model_weights is None:
         logger.info("Initializing optimizer from scratch (model-zoo weights have no companion optimizer state).")
         return optimizer
@@ -271,6 +317,60 @@ def _build_contrastive_feature_extractor(settings: TrainingConfig) -> Any:
         feature_level=feature_level,
         normalize_features=settings.contrastive_normalize_features,
     )
+
+
+def _build_contrareg_modules(settings: TrainingConfig):
+    if not settings.contrareg_enabled:
+        return None, None, None
+
+    fixed_encoder, _ = _load_encoder_and_metadata_from_checkpoint(
+        settings.contrareg_fixed_ae_checkpoint
+    )
+    moving_encoder, _ = _load_encoder_and_metadata_from_checkpoint(
+        settings.contrareg_moving_ae_checkpoint
+    )
+    encoder_pair = FrozenContraRegEncoderPair(
+        fixed_encoder=fixed_encoder,
+        moving_encoder=moving_encoder,
+    )
+    feature_channels = tuple(settings.contrareg_feature_channels)
+    projector_fixed = PatchProjector3D(
+        feature_channels=feature_channels,
+        embed_dim=settings.contrareg_embed_dim,
+    )
+    projector_moving = PatchProjector3D(
+        feature_channels=feature_channels,
+        embed_dim=settings.contrareg_embed_dim,
+    )
+    return encoder_pair, projector_fixed, projector_moving
+
+
+def _contrareg_weights_path(model_weights: str) -> str:
+    weights_filename = os.path.basename(model_weights)
+    weights_dir = os.path.dirname(model_weights)
+    if weights_filename.startswith(NETWORK_WEIGHTS_PREFIX):
+        contrareg_filename = weights_filename.replace(
+            NETWORK_WEIGHTS_PREFIX, CONTRAREG_WEIGHTS_PREFIX, 1
+        )
+    else:
+        contrareg_filename = f"{CONTRAREG_WEIGHTS_PREFIX}_{weights_filename}"
+    return os.path.join(weights_dir, contrareg_filename)
+
+
+def _load_contrareg_weights(net: Any, model_weights: Optional[str]) -> None:
+    if not getattr(net, "contrareg_enabled", False) or model_weights is None:
+        return
+    contrareg_path = _contrareg_weights_path(model_weights)
+    if not os.path.exists(contrareg_path):
+        logger.info(
+            f"ContraReg projector checkpoint not found at {contrareg_path}; "
+            "initializing projectors from scratch."
+        )
+        return
+    logger.info(f"Loading ContraReg projector weights from {contrareg_path}.")
+    bundle = torch.load(contrareg_path, map_location="cpu", weights_only=False)
+    net.projector_fixed.load_state_dict(bundle["projector_fixed"], strict=True)
+    net.projector_moving.load_state_dict(bundle["projector_moving"], strict=True)
 
 
 def _build_forward_kwargs(
@@ -487,6 +587,7 @@ def finetune_multi(
         mind_radius=settings.mind_radius,
         mind_dilation=settings.mind_dilation,
     )
+    contrareg_encoder_pair, projector_fixed, projector_moving = _build_contrareg_modules(settings)
     net = unigradicon.make_network(
         settings.network_input_shape,
         include_last_step=True,
@@ -501,8 +602,17 @@ def finetune_multi(
         contrastive_num_samples=settings.contrastive_num_samples,
         contrastive_warmup_epochs=settings.contrastive_warmup_epochs,
         use_contrastive_loss=settings.use_contrastive_loss,
+        contrareg_enabled=settings.contrareg_enabled,
+        contrareg_weight=settings.contrareg_weight,
+        contrareg_num_patches=settings.contrareg_num_patches,
+        contrareg_temperature=settings.contrareg_temperature,
+        contrareg_bidirectional=settings.contrareg_bidirectional,
+        contrareg_encoder_pair=contrareg_encoder_pair,
+        projector_fixed=projector_fixed,
+        projector_moving=projector_moving,
     )
     model_weights = _load_network_weights(net, exp_config[ExperimentKeys.MODEL_WEIGHTS], loss_fn, settings)
+    _load_contrareg_weights(net, model_weights)
 
     if device.type == "cuda" and len(settings.gpus) > 1:
         net_par = torch.nn.DataParallel(
@@ -511,7 +621,9 @@ def finetune_multi(
     else:
         net_par = net.to(device)
 
-    optimizer = _build_optimizer(net, settings.learning_rate, model_weights)
+    optimizer = _build_optimizer(
+        net, settings.learning_rate, model_weights, contrareg_enabled=settings.contrareg_enabled
+    )
     net_par.train()
     os.makedirs(os.path.join(footsteps.output_dir, CHECKPOINT_DIR), exist_ok=True)
     writer = SummaryWriter(
@@ -543,6 +655,8 @@ def finetune_multi(
         f"dice_loss_weight={settings.dice_loss_weight}, "
         f"use_contrastive_loss={settings.use_contrastive_loss}, "
         f"contrastive_loss_weight={settings.contrastive_loss_weight}, "
+        f"contrareg_enabled={settings.contrareg_enabled}, "
+        f"contrareg_weight={settings.contrareg_weight}, "
         f"loss_function_masking={settings.loss_function_masking}, "
         f"roi_masking={settings.roi_masking}, use_label={settings.use_label}."
     )
@@ -579,7 +693,7 @@ def finetune_multi(
             is_last_epoch = (epoch == settings.epochs - 1)
             is_periodic_save = (epoch > 0 and epoch % settings.save_period == 0)
             if is_periodic_save and not is_last_epoch:
-                _save_checkpoint(net, optimizer, footsteps.output_dir, epoch)
+                _save_checkpoint(net, optimizer, footsteps.output_dir, epoch, settings=settings)
                 logger.info(f"Wrote checkpoint for epoch {epoch}.")
 
             if epoch % settings.eval_period == 0:
@@ -596,7 +710,7 @@ def finetune_multi(
                     current_epoch=epoch,
                 )
 
-        _save_checkpoint(net, optimizer, footsteps.output_dir, "final")
+        _save_checkpoint(net, optimizer, footsteps.output_dir, "final", settings=settings)
         logger.info("Training loop completed; final checkpoint written.")
     finally:
         writer.close()
@@ -631,7 +745,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         logger.info(f"Reproducibility seed set: {seed}.")
 
     os.makedirs("results", exist_ok=True)
-    footsteps.initialize(run_name=exp_config[ExperimentKeys.NAME])
+    _initialize_footsteps(run_name=exp_config[ExperimentKeys.NAME])
 
     loaders = create_data_loaders(args.config, config=config)
     config = loaders.config
