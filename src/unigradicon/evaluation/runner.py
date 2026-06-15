@@ -503,7 +503,7 @@ def _run_case(
         f"{case.case_id}: registration started ({reg_mode}, io_iterations={settings.io_iterations}, io_lr={settings.io_lr})"
     )
     if settings.loss_function_masking or needs_seg:
-        phi_ab, _ = icon_registration.itk_wrapper.register_pair_with_mask(
+        phi_ab, phi_ba = icon_registration.itk_wrapper.register_pair_with_mask(
             net,
             moving_pre,
             fixed_pre,
@@ -515,7 +515,7 @@ def _run_case(
             segmentation_B=fixed_seg if needs_seg else None,
         )
     else:
-        phi_ab, _ = icon_registration.itk_wrapper.register_pair(
+        phi_ab, phi_ba = icon_registration.itk_wrapper.register_pair(
             net,
             moving_pre,
             fixed_pre,
@@ -577,11 +577,13 @@ def _run_case(
                 invert=True,
             )
             diagnostics["initial_inverse_only"] = mean_point_distance_mm(init_inverse, fixed_points)
-            phi_after_init_direct = _transform_points(init_direct, phi_ab)
+            # phi_ba maps moving-space points into fixed space (phi_ab is the
+            # fixed->moving map used to resample the moving image onto the fixed grid).
+            phi_after_init_direct = _transform_points(init_direct, phi_ba)
             diagnostics["phi_after_initial_direct"] = mean_point_distance_mm(
                 phi_after_init_direct, fixed_points
             )
-            phi_after_init_inverse = _transform_points(init_inverse, phi_ab)
+            phi_after_init_inverse = _transform_points(init_inverse, phi_ba)
             diagnostics["phi_after_initial_inverse"] = mean_point_distance_mm(
                 phi_after_init_inverse, fixed_points
             )
@@ -602,7 +604,7 @@ def _run_case(
         metrics["tre"] = compute_tre_mm(
             moving_points=moving_points_for_tre,
             fixed_points=fixed_points,
-            predicted_transform=phi_ab,
+            predicted_transform=phi_ba,
             initial_transform=None,
         )
         metrics["tre_baseline_raw_mm"] = tre_baseline_raw_mm
@@ -650,7 +652,8 @@ def _run_case(
             method_output_dir=method_output_dir,
             settings=settings,
         )
-        moved_points = _transform_points(moving_points, phi_ab)
+        # phi_ba maps moving-space surface points into fixed space.
+        moved_points = _transform_points(moving_points, phi_ba)
         fixed_surface_points_count = int(fixed_points.shape[0])
         moving_surface_points_count = int(moving_points.shape[0])
         metrics["chamfer"], metrics["chamfer_half"] = compute_chamfer_mm(moved_points, fixed_points)

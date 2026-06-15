@@ -2,6 +2,8 @@ from typing import Optional
 
 import itk
 import numpy as np
+from medpy.metric.binary import hd95 as medpy_hd95
+from medpy.metric.image import mutual_information as medpy_mi
 from scipy.spatial import cKDTree
 
 
@@ -156,37 +158,19 @@ def compute_dice_score(fixed_seg: itk.Image, warped_moving_seg: itk.Image) -> fl
 
 
 def compute_hd95_mm(fixed_seg: itk.Image, warped_moving_seg: itk.Image) -> float:
-    fixed_binary = _binary_mask(fixed_seg)
-    moving_binary = _binary_mask(warped_moving_seg)
-    contour_fixed = itk.binary_contour_image_filter(fixed_binary)
-    contour_moving = itk.binary_contour_image_filter(moving_binary)
-
-    if np.count_nonzero(itk.GetArrayFromImage(contour_fixed)) == 0:
-        return float("nan")
-    if np.count_nonzero(itk.GetArrayFromImage(contour_moving)) == 0:
+    fixed = itk.GetArrayFromImage(fixed_seg).astype(np.int64)
+    moving = itk.GetArrayFromImage(warped_moving_seg).astype(np.int64)
+    labels = sorted((set(np.unique(fixed)) & set(np.unique(moving))) - {0})
+    if not labels:
         return float("nan")
 
-    dist_to_moving = itk.abs_image_filter(
-        itk.signed_maurer_distance_map_image_filter(
-            moving_binary, squared_distance=False, use_image_spacing=True, inside_is_positive=False
-        )
-    )
-    dist_to_fixed = itk.abs_image_filter(
-        itk.signed_maurer_distance_map_image_filter(
-            fixed_binary, squared_distance=False, use_image_spacing=True, inside_is_positive=False
-        )
-    )
-
-    contour_fixed_arr = itk.GetArrayFromImage(contour_fixed) > 0
-    contour_moving_arr = itk.GetArrayFromImage(contour_moving) > 0
-    dist_to_moving_arr = itk.GetArrayFromImage(dist_to_moving)
-    dist_to_fixed_arr = itk.GetArrayFromImage(dist_to_fixed)
-
-    d_fixed_to_moving = dist_to_moving_arr[contour_fixed_arr]
-    d_moving_to_fixed = dist_to_fixed_arr[contour_moving_arr]
-    hd95_a = np.percentile(d_fixed_to_moving, 95)
-    hd95_b = np.percentile(d_moving_to_fixed, 95)
-    return float(max(hd95_a, hd95_b))
+    # ITK spacing is (x, y, z); the numpy array axes are (z, y, x), so reverse.
+    spacing = tuple(float(s) for s in fixed_seg.GetSpacing())[::-1]
+    scores = [
+        float(medpy_hd95(moving == label, fixed == label, voxelspacing=spacing))
+        for label in labels
+    ]
+    return float(np.mean(scores))
 
 
 def compute_mutual_information(
@@ -205,14 +189,11 @@ def compute_mutual_information(
         fixed = fixed.ravel()
         moving = moving.ravel()
 
+    finite = np.isfinite(fixed) & np.isfinite(moving)
+    fixed = fixed[finite]
+    moving = moving[finite]
+
     if fixed.size == 0 or moving.size == 0:
         return float("nan")
 
-    hist_2d, _, _ = np.histogram2d(fixed, moving, bins=bins)
-    pxy = hist_2d / np.sum(hist_2d)
-    px = np.sum(pxy, axis=1, keepdims=True)
-    py = np.sum(pxy, axis=0, keepdims=True)
-
-    nz = pxy > 0
-    mi = np.sum(pxy[nz] * np.log(pxy[nz] / (px @ py)[nz]))
-    return float(mi)
+    return float(medpy_mi(fixed, moving, bins=bins))
