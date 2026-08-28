@@ -21,7 +21,11 @@ from .contrastive import (
 )
 from .contrareg import FrozenContraRegEncoderPair
 from .encoders import AutoEncoder, build_encoder_from_arch
-from .patch_contrastive import PatchProjector3D, multi_scale_patch_nce_loss
+from .patch_contrastive import (
+    PatchProjector3D,
+    multi_scale_patch_nce_loss,
+    sample_patch_ids_from_mask,
+)
 
 # Extended loss object that includes dice_loss for segmentation-based training
 ICONDiceLoss = namedtuple('ICONDiceLoss', ['all_loss', 'inverse_consistency_loss', 'similarity_loss', 'transform_magnitude', 'flips', 'dice_loss'])
@@ -76,9 +80,10 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
         contrareg_num_patches=512,
         contrareg_temperature=0.07,
         contrareg_bidirectional=False,
+        contrareg_roi_patches=False,
         contrareg_encoder_pair=None,
-        projector_fixed=None,
-        projector_moving=None,
+        projector_preop=None,
+        projector_us=None,
     ):
         super().__init__()
 
@@ -119,19 +124,20 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
         self.contrareg_num_patches = int(contrareg_num_patches)
         self.contrareg_temperature = float(contrareg_temperature)
         self.contrareg_bidirectional = bool(contrareg_bidirectional)
+        self.contrareg_roi_patches = bool(contrareg_roi_patches)
         if self.contrareg_enabled:
-            if contrareg_encoder_pair is None or projector_fixed is None or projector_moving is None:
+            if contrareg_encoder_pair is None or projector_preop is None or projector_us is None:
                 raise ValueError(
-                    "contrareg_encoder_pair, projector_fixed, and projector_moving must be "
+                    "contrareg_encoder_pair, projector_preop, and projector_us must be "
                     "provided when ContraReg is enabled."
                 )
             self.contrareg_encoder_pair = contrareg_encoder_pair
-            self.projector_fixed = projector_fixed
-            self.projector_moving = projector_moving
+            self.projector_preop = projector_preop
+            self.projector_us = projector_us
         else:
             self.contrareg_encoder_pair = None
-            self.projector_fixed = None
-            self.projector_moving = None
+            self.projector_preop = None
+            self.projector_us = None
 
     def forward(
         self,
@@ -369,7 +375,20 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
 
         contrareg_loss = torch.zeros((), dtype=image_A.dtype, device=image_A.device)
         if self.contrareg_enabled:
-            contrareg_loss = self.compute_contrareg_loss(image_B, self.warped_image_A)
+            if modality_A is None or modality_B is None:
+                raise ValueError(
+                    "modality_A and modality_B must be provided when ContraReg is enabled "
+                    "(needed to route each image to its per-modality frozen encoder)."
+                )
+            contrareg_loss = self.compute_contrareg_loss(
+                fixed=image_B,
+                # Slice off the inbounds tag channel appended for interpolated
+                # similarity measures; the frozen encoders expect 1 channel.
+                warped_moving=self.warped_image_A[:, :1],
+                modality_fixed=modality_B,
+                modality_moving=modality_A,
+                mask=mask_B if self.contrareg_roi_patches else None,
+            )
 
         all_loss = registration_loss + self.contrareg_weight * contrareg_loss
 
@@ -493,40 +512,95 @@ class GradientICONSparse(network_wrappers.RegistrationModule):
         loss_ctr_BA = self.contrastive_loss_fn(z_B_warped, z_A, mask_A)
         return loss_ctr_AB + loss_ctr_BA
 
-    def compute_contrareg_loss(self, fixed, warped_moving):
+    def _contrareg_projector_for(self, modality):
+        key = self.contrareg_encoder_pair.resolve_modality_key(modality)
+        return self.projector_preop if key == "preop" else self.projector_us
+
+    @staticmethod
+    def _modality_for_item(modality, item_index, batch_size):
+        if isinstance(modality, str):
+            return modality
+        if len(modality) != batch_size:
+            raise ValueError(
+                f"Expected one modality per batch item, got batch={batch_size} "
+                f"and modalities={len(modality)}."
+            )
+        return modality[item_index]
+
+    def compute_contrareg_loss(
+        self,
+        fixed,
+        warped_moving,
+        modality_fixed,
+        modality_moving,
+        mask=None,
+    ):
+        """Multi-scale PatchNCE between the fixed image and the warped moving
+        image, both on the fixed grid.
+
+        Each image is routed to its own modality's frozen encoder and
+        trainable projector (per batch item — the paired sampler can place
+        either modality in the A/moving or B/fixed slot). When ``mask`` is
+        given, patch ids are restricted to the ROI; the same ids are shared
+        between fixed and moving so positives stay spatially matched.
+        """
         if not self.contrareg_enabled or self.contrareg_encoder_pair is None:
             return torch.zeros((), dtype=fixed.dtype, device=fixed.device)
-
-        fixed_features = self.contrareg_encoder_pair.encode_fixed(fixed)
-        moving_features = self.contrareg_encoder_pair.encode_moving(warped_moving)
-
-        fixed_proj, patch_ids = self.projector_fixed(
-            fixed_features,
-            num_patches=self.contrareg_num_patches,
-        )
-        moving_proj, _ = self.projector_moving(
-            moving_features,
-            num_patches=self.contrareg_num_patches,
-            patch_ids=patch_ids,
-        )
+        if self.contrareg_roi_patches and mask is None:
+            raise ValueError(
+                "contrareg_roi_patches=True requires an ROI mask (mask_B) in the batch."
+            )
 
         batch_size = fixed.shape[0]
-        loss = multi_scale_patch_nce_loss(
-            fixed_proj,
-            moving_proj,
-            batch_size=batch_size,
-            num_patches=self.contrareg_num_patches,
-            temperature=self.contrareg_temperature,
-        )
-        if self.contrareg_bidirectional:
-            loss = loss + multi_scale_patch_nce_loss(
-                moving_proj,
+        item_losses = []
+        for b in range(batch_size):
+            item_modality_fixed = self._modality_for_item(modality_fixed, b, batch_size)
+            item_modality_moving = self._modality_for_item(modality_moving, b, batch_size)
+
+            fixed_features = self.contrareg_encoder_pair.encode(
+                fixed[b:b + 1], item_modality_fixed
+            )
+            moving_features = self.contrareg_encoder_pair.encode(
+                warped_moving[b:b + 1], item_modality_moving
+            )
+
+            roi_patch_ids = None
+            if mask is not None:
+                roi_patch_ids = sample_patch_ids_from_mask(
+                    mask[b:b + 1],
+                    [feat.shape for feat in fixed_features],
+                    num_patches=self.contrareg_num_patches,
+                )
+
+            fixed_proj, patch_ids = self._contrareg_projector_for(item_modality_fixed)(
+                fixed_features,
+                num_patches=self.contrareg_num_patches,
+                patch_ids=roi_patch_ids,
+            )
+            moving_proj, _ = self._contrareg_projector_for(item_modality_moving)(
+                moving_features,
+                num_patches=self.contrareg_num_patches,
+                patch_ids=patch_ids,
+            )
+
+            item_loss = multi_scale_patch_nce_loss(
                 fixed_proj,
-                batch_size=batch_size,
+                moving_proj,
+                batch_size=1,
                 num_patches=self.contrareg_num_patches,
                 temperature=self.contrareg_temperature,
             )
-        return loss
+            if self.contrareg_bidirectional:
+                item_loss = item_loss + multi_scale_patch_nce_loss(
+                    moving_proj,
+                    fixed_proj,
+                    batch_size=1,
+                    num_patches=self.contrareg_num_patches,
+                    temperature=self.contrareg_temperature,
+                )
+            item_losses.append(item_loss)
+
+        return torch.stack(item_losses).mean()
 
     def compute_jacobian_determinant(self, phi):
         if len(phi.size()) == 4:
@@ -618,9 +692,10 @@ def make_network(
     contrareg_num_patches=512,
     contrareg_temperature=0.07,
     contrareg_bidirectional=False,
+    contrareg_roi_patches=False,
     contrareg_encoder_pair=None,
-    projector_fixed=None,
-    projector_moving=None,
+    projector_preop=None,
+    projector_us=None,
 ):
     dimension = len(input_shape) - 2
     inner_net = icon.FunctionFromVectorField(networks.tallUNet2(dimension=dimension))
@@ -652,9 +727,10 @@ def make_network(
         contrareg_num_patches=contrareg_num_patches,
         contrareg_temperature=contrareg_temperature,
         contrareg_bidirectional=contrareg_bidirectional,
+        contrareg_roi_patches=contrareg_roi_patches,
         contrareg_encoder_pair=contrareg_encoder_pair,
-        projector_fixed=projector_fixed,
-        projector_moving=projector_moving,
+        projector_preop=projector_preop,
+        projector_us=projector_us,
     )
     net.assign_identity_map(input_shape)
     return net

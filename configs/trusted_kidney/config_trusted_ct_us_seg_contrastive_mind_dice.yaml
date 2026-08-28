@@ -20,6 +20,7 @@ training:
   mind_dilation: 2        # optional (default 2)
   lambda: 1.5
   dice_loss_weight: 0.3
+  roi_masking: true
   contrareg_enabled: true
   contrareg_weight: 0.01
   contrareg_num_patches: 512
@@ -27,14 +28,16 @@ training:
   contrareg_embed_dim: 256
   contrareg_feature_channels: [32, 64, 128]
   contrareg_bidirectional: false
+  contrareg_roi_patches: true  # restrict PatchNCE sampling to the ROI mask
   use_contrastive_loss: false  # required — mutually exclusive with dense InfoNCE
-  contrareg_fixed_ae_checkpoint: "results/encoder_pretrain/us_encoder.ckpt"   # encoder for IMAGE_B (fixed)
-  contrareg_moving_ae_checkpoint: "results/encoder_pretrain/preop_encoder.ckpt"  # encoder for IMAGE_A (moving/preop)
+  # Encoders are routed per image by its 'modality' field (preop = ct/mri/mr, us = us).
+  contrareg_preop_ae_checkpoint: "results/encoder_pretrain/preop_encoder.ckpt"
+  contrareg_us_ae_checkpoint: "results/encoder_pretrain/us_encoder.ckpt"
 
 datasets:
   - name: "kidney_ct_us_paired"
     type: "paired"
-    json_file: "kidney_finetuning_pairs.json"
+    json_file: "../../src/unigradicon/finetuning/configs/kidney_finetuning_pairs_roi.json"
     use_cache: false
     weight: 1.0
     is_ct: false

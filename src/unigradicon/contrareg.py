@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Sequence
 import torch
 import torch.nn as nn
 
+from .contrastive import PREOP_MODALITIES, US_MODALITIES
+
 
 def _encode_without_grad_block(encoder: nn.Module, x: torch.Tensor) -> List[torch.Tensor]:
     """Run encoder forward without no_grad so gradients reach inputs."""
@@ -28,14 +30,21 @@ def _encode_without_grad_block(encoder: nn.Module, x: torch.Tensor) -> List[torc
 
 
 class FrozenContraRegEncoderPair(nn.Module):
-    """Two frozen autoencoders; encode runs without no_grad so grads reach inputs."""
+    """Two frozen per-modality autoencoders; encode runs without no_grad so
+    grads reach inputs.
 
-    def __init__(self, fixed_encoder: nn.Module, moving_encoder: nn.Module):
+    Encoders are keyed by modality (preop vs US), not by registration role
+    (fixed vs moving): the paired sampler can put either modality in the
+    A/moving or B/fixed slot, so routing must follow each image's modality
+    string rather than its role in the pair.
+    """
+
+    def __init__(self, preop_encoder: nn.Module, us_encoder: nn.Module):
         super().__init__()
-        self.fixed_encoder = fixed_encoder
-        self.moving_encoder = moving_encoder
-        self._freeze_encoder(self.fixed_encoder)
-        self._freeze_encoder(self.moving_encoder)
+        self.preop_encoder = preop_encoder
+        self.us_encoder = us_encoder
+        self._freeze_encoder(self.preop_encoder)
+        self._freeze_encoder(self.us_encoder)
 
     @staticmethod
     def _freeze_encoder(encoder: nn.Module) -> None:
@@ -43,11 +52,31 @@ class FrozenContraRegEncoderPair(nn.Module):
         for param in encoder.parameters():
             param.requires_grad = False
 
-    def encode_fixed(self, x: torch.Tensor) -> List[torch.Tensor]:
-        return _encode_without_grad_block(self.fixed_encoder, x)
+    def train(self, mode: bool = True) -> "FrozenContraRegEncoderPair":
+        """Keep the frozen encoders in eval mode even when the parent network
+        is switched to train mode (``net.train()`` recurses into children)."""
+        super().train(mode)
+        self.preop_encoder.eval()
+        self.us_encoder.eval()
+        return self
 
-    def encode_moving(self, x: torch.Tensor) -> List[torch.Tensor]:
-        return _encode_without_grad_block(self.moving_encoder, x)
+    @staticmethod
+    def resolve_modality_key(modality: str) -> str:
+        """Map a raw modality string to 'preop' or 'us'; raise on unknown."""
+        normalized = (modality or "").lower()
+        if normalized in PREOP_MODALITIES:
+            return "preop"
+        if normalized in US_MODALITIES:
+            return "us"
+        raise ValueError(
+            f"Unknown modality '{modality}' for ContraReg encoder routing. "
+            f"Expected one of {sorted(PREOP_MODALITIES | US_MODALITIES)}."
+        )
+
+    def encode(self, x: torch.Tensor, modality: str) -> List[torch.Tensor]:
+        key = self.resolve_modality_key(modality)
+        encoder = self.preop_encoder if key == "preop" else self.us_encoder
+        return _encode_without_grad_block(encoder, x)
 
 
 def contrareg_config_snapshot(settings: Any) -> Dict[str, Any]:
@@ -60,6 +89,7 @@ def contrareg_config_snapshot(settings: Any) -> Dict[str, Any]:
         "contrareg_embed_dim": settings.contrareg_embed_dim,
         "contrareg_feature_channels": list(settings.contrareg_feature_channels),
         "contrareg_bidirectional": settings.contrareg_bidirectional,
-        "contrareg_fixed_ae_checkpoint": settings.contrareg_fixed_ae_checkpoint,
-        "contrareg_moving_ae_checkpoint": settings.contrareg_moving_ae_checkpoint,
+        "contrareg_roi_patches": settings.contrareg_roi_patches,
+        "contrareg_preop_ae_checkpoint": settings.contrareg_preop_ae_checkpoint,
+        "contrareg_us_ae_checkpoint": settings.contrareg_us_ae_checkpoint,
     }

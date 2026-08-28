@@ -84,8 +84,9 @@ class TrainingKeys:
     CONTRAREG_EMBED_DIM = 'contrareg_embed_dim'
     CONTRAREG_FEATURE_CHANNELS = 'contrareg_feature_channels'
     CONTRAREG_BIDIRECTIONAL = 'contrareg_bidirectional'
-    CONTRAREG_FIXED_AE_CHECKPOINT = 'contrareg_fixed_ae_checkpoint'
-    CONTRAREG_MOVING_AE_CHECKPOINT = 'contrareg_moving_ae_checkpoint'
+    CONTRAREG_ROI_PATCHES = 'contrareg_roi_patches'
+    CONTRAREG_PREOP_AE_CHECKPOINT = 'contrareg_preop_ae_checkpoint'
+    CONTRAREG_US_AE_CHECKPOINT = 'contrareg_us_ae_checkpoint'
     STAGE_EPOCHS = 'stage_epochs'
 
 
@@ -215,8 +216,9 @@ class TrainingConfig:
     contrareg_embed_dim: int = 256
     contrareg_feature_channels: List[int] = field(default_factory=lambda: [32, 64, 128])
     contrareg_bidirectional: bool = False
-    contrareg_fixed_ae_checkpoint: Optional[str] = None
-    contrareg_moving_ae_checkpoint: Optional[str] = None
+    contrareg_roi_patches: bool = False
+    contrareg_preop_ae_checkpoint: Optional[str] = None
+    contrareg_us_ae_checkpoint: Optional[str] = None
     loss_function_masking: bool = False
     roi_masking: bool = False
     seed: Optional[int] = None
@@ -421,6 +423,7 @@ class ConfigValidator:
             TrainingKeys.CONTRASTIVE_NORMALIZE_FEATURES,
             TrainingKeys.CONTRAREG_ENABLED,
             TrainingKeys.CONTRAREG_BIDIRECTIONAL,
+            TrainingKeys.CONTRAREG_ROI_PATCHES,
         ):
             if bool_key in train_config and not isinstance(train_config[bool_key], bool):
                 raise ValueError(f"'{bool_key}' must be a boolean")
@@ -467,6 +470,23 @@ class ConfigValidator:
                     f"'{TrainingKeys.CONTRAREG_FEATURE_CHANNELS}' must be a length-3 list of "
                     f"positive integers (got {channels})"
                 )
+        # Legacy role-keyed checkpoint keys are rejected outright: configs (and
+        # checkpoints) that used them were trained under a modality mis-routing
+        # bug, so migration must be a conscious choice, not a silent alias.
+        legacy_contrareg_keys = {
+            "contrareg_fixed_ae_checkpoint": TrainingKeys.CONTRAREG_US_AE_CHECKPOINT,
+            "contrareg_moving_ae_checkpoint": TrainingKeys.CONTRAREG_PREOP_AE_CHECKPOINT,
+        }
+        for legacy_key, new_key in legacy_contrareg_keys.items():
+            if legacy_key in train_config:
+                raise ValueError(
+                    f"'{legacy_key}' is no longer supported: ContraReg encoders are now "
+                    f"routed by image modality, not by fixed/moving role. Rename it to "
+                    f"'{new_key}' (fixed was the US encoder, moving the preop encoder). "
+                    f"Note: ContraReg projector checkpoints trained before this change "
+                    f"were affected by a modality mis-routing bug and should be retrained."
+                )
+
         contrareg_enabled = train_config.get(TrainingKeys.CONTRAREG_ENABLED, False)
         use_contrastive = train_config.get(TrainingKeys.USE_CONTRASTIVE_LOSS, False)
         if contrareg_enabled and use_contrastive:
@@ -474,10 +494,18 @@ class ConfigValidator:
                 "ContraReg patch NCE (contrareg_enabled=true) and dense contrastive loss "
                 "(use_contrastive_loss=true) cannot both be enabled. Disable one of them."
             )
+        if (
+            train_config.get(TrainingKeys.CONTRAREG_ROI_PATCHES, False)
+            and not contrareg_enabled
+        ):
+            raise ValueError(
+                f"'{TrainingKeys.CONTRAREG_ROI_PATCHES}' requires "
+                f"'{TrainingKeys.CONTRAREG_ENABLED}' to be true."
+            )
         if contrareg_enabled:
             for ckpt_key in (
-                TrainingKeys.CONTRAREG_FIXED_AE_CHECKPOINT,
-                TrainingKeys.CONTRAREG_MOVING_AE_CHECKPOINT,
+                TrainingKeys.CONTRAREG_PREOP_AE_CHECKPOINT,
+                TrainingKeys.CONTRAREG_US_AE_CHECKPOINT,
             ):
                 ckpt_path = train_config.get(ckpt_key)
                 if not ckpt_path:
@@ -693,6 +721,8 @@ def required_data_fields(training: TrainingConfig) -> FrozenSet[str]:
     if training.dice_loss_weight > 0.0:
         required.add(dataset.Fields.SEGMENTATION)
     if training.loss_function_masking or training.roi_masking:
+        required.add(dataset.Fields.MASK)
+    if training.contrareg_enabled and training.contrareg_roi_patches:
         required.add(dataset.Fields.MASK)
     return frozenset(required)
 

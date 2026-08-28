@@ -136,11 +136,11 @@ def _save_checkpoint(
         optimizer.state_dict(),
         os.path.join(output_dir, CHECKPOINT_DIR, f"{OPTIMIZER_WEIGHTS_PREFIX}_{epoch}.trch"),
     )
-    if settings is not None and settings.contrareg_enabled and net.projector_fixed is not None:
+    if settings is not None and settings.contrareg_enabled and net.projector_preop is not None:
         torch.save(
             {
-                "projector_fixed": net.projector_fixed.state_dict(),
-                "projector_moving": net.projector_moving.state_dict(),
+                "projector_preop": net.projector_preop.state_dict(),
+                "projector_us": net.projector_us.state_dict(),
                 "contrareg_config": contrareg_config_snapshot(settings),
             },
             os.path.join(output_dir, CHECKPOINT_DIR, f"{CONTRAREG_WEIGHTS_PREFIX}_{epoch}.trch"),
@@ -209,8 +209,8 @@ def _build_optimizer(
     """
     param_groups = list(net.regis_net.parameters())
     if contrareg_enabled:
-        param_groups = list(param_groups) + list(net.projector_fixed.parameters()) + list(
-            net.projector_moving.parameters()
+        param_groups = list(param_groups) + list(net.projector_preop.parameters()) + list(
+            net.projector_us.parameters()
         )
     optimizer = torch.optim.Adam(param_groups, lr=learning_rate)
     if model_weights is None:
@@ -323,26 +323,26 @@ def _build_contrareg_modules(settings: TrainingConfig):
     if not settings.contrareg_enabled:
         return None, None, None
 
-    fixed_encoder, _ = _load_encoder_and_metadata_from_checkpoint(
-        settings.contrareg_fixed_ae_checkpoint
+    preop_encoder, _ = _load_encoder_and_metadata_from_checkpoint(
+        settings.contrareg_preop_ae_checkpoint
     )
-    moving_encoder, _ = _load_encoder_and_metadata_from_checkpoint(
-        settings.contrareg_moving_ae_checkpoint
+    us_encoder, _ = _load_encoder_and_metadata_from_checkpoint(
+        settings.contrareg_us_ae_checkpoint
     )
     encoder_pair = FrozenContraRegEncoderPair(
-        fixed_encoder=fixed_encoder,
-        moving_encoder=moving_encoder,
+        preop_encoder=preop_encoder,
+        us_encoder=us_encoder,
     )
     feature_channels = tuple(settings.contrareg_feature_channels)
-    projector_fixed = PatchProjector3D(
+    projector_preop = PatchProjector3D(
         feature_channels=feature_channels,
         embed_dim=settings.contrareg_embed_dim,
     )
-    projector_moving = PatchProjector3D(
+    projector_us = PatchProjector3D(
         feature_channels=feature_channels,
         embed_dim=settings.contrareg_embed_dim,
     )
-    return encoder_pair, projector_fixed, projector_moving
+    return encoder_pair, projector_preop, projector_us
 
 
 def _contrareg_weights_path(model_weights: str) -> str:
@@ -369,8 +369,16 @@ def _load_contrareg_weights(net: Any, model_weights: Optional[str]) -> None:
         return
     logger.info(f"Loading ContraReg projector weights from {contrareg_path}.")
     bundle = torch.load(contrareg_path, map_location="cpu", weights_only=False)
-    net.projector_fixed.load_state_dict(bundle["projector_fixed"], strict=True)
-    net.projector_moving.load_state_dict(bundle["projector_moving"], strict=True)
+    if "projector_fixed" in bundle or "projector_moving" in bundle:
+        raise ValueError(
+            f"ContraReg projector bundle {contrareg_path} uses the legacy "
+            f"'projector_fixed'/'projector_moving' keys. These projectors were trained "
+            f"under a modality mis-routing bug (encoders received the wrong modality for "
+            f"~half the batches) and are not portable to the modality-routed pipeline. "
+            f"Retrain, or delete the bundle to initialize projectors from scratch."
+        )
+    net.projector_preop.load_state_dict(bundle["projector_preop"], strict=True)
+    net.projector_us.load_state_dict(bundle["projector_us"], strict=True)
 
 
 def _build_forward_kwargs(
@@ -386,10 +394,17 @@ def _build_forward_kwargs(
     if settings.dice_loss_weight > 0.0 and Fields.SEGMENTATION in data_fields:
         forward_kwargs[PairKeys.SEGMENTATION_A] = batch[PairKeys.SEGMENTATION_A]
         forward_kwargs[PairKeys.SEGMENTATION_B] = batch[PairKeys.SEGMENTATION_B]
-    if settings.loss_function_masking and Fields.MASK in data_fields:
+    needs_mask = (
+        settings.loss_function_masking
+        # ContraReg ROI-restricted patch sampling.
+        or (settings.contrareg_enabled and settings.contrareg_roi_patches)
+        # Dense InfoNCE samples voxels inside the mask when one is available.
+        or settings.use_contrastive_loss
+    )
+    if needs_mask and Fields.MASK in data_fields:
         forward_kwargs[PairKeys.MASK_A] = batch[PairKeys.MASK_A]
         forward_kwargs[PairKeys.MASK_B] = batch[PairKeys.MASK_B]
-    if settings.use_contrastive_loss:
+    if settings.use_contrastive_loss or settings.contrareg_enabled:
         forward_kwargs[PairKeys.MODALITY_A] = batch[PairKeys.MODALITY_A]
         forward_kwargs[PairKeys.MODALITY_B] = batch[PairKeys.MODALITY_B]
         forward_kwargs["current_epoch"] = current_epoch
@@ -587,7 +602,7 @@ def finetune_multi(
         mind_radius=settings.mind_radius,
         mind_dilation=settings.mind_dilation,
     )
-    contrareg_encoder_pair, projector_fixed, projector_moving = _build_contrareg_modules(settings)
+    contrareg_encoder_pair, projector_preop, projector_us = _build_contrareg_modules(settings)
     net = unigradicon.make_network(
         settings.network_input_shape,
         include_last_step=True,
@@ -607,9 +622,10 @@ def finetune_multi(
         contrareg_num_patches=settings.contrareg_num_patches,
         contrareg_temperature=settings.contrareg_temperature,
         contrareg_bidirectional=settings.contrareg_bidirectional,
+        contrareg_roi_patches=settings.contrareg_roi_patches,
         contrareg_encoder_pair=contrareg_encoder_pair,
-        projector_fixed=projector_fixed,
-        projector_moving=projector_moving,
+        projector_preop=projector_preop,
+        projector_us=projector_us,
     )
     model_weights = _load_network_weights(net, exp_config[ExperimentKeys.MODEL_WEIGHTS], loss_fn, settings)
     _load_contrareg_weights(net, model_weights)

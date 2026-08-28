@@ -1,0 +1,32 @@
+experiment:
+  name: "trusted_ct_us_seg_finetune_mind_dice_roi_fixed"
+  model_weights: "/home/jovyan/kidney_dataset/weights/Step_2_final.trch"
+  use_wandb: true
+  wandb_project: "multigradicon-finetune"
+  wandb_entity: null
+  wandb_run_name: "trusted_ct_us_finetuning_200epochs_mind_dice_roi_fixed_affine"
+
+training:
+  batch_size: 1
+  gpus: [0]
+  epochs: 200
+  eval_period: 10
+  save_period: 50
+  learning_rate: 0.00005
+  input_shape: [175, 175, 175]
+  similarity: "mind"
+  mind_radius: 2
+  mind_dilation: 2
+  lambda: 1.5
+  dice_loss_weight: 0.3
+  roi_masking: true
+
+datasets:
+  - name: "kidney_ct_us_paired"
+    type: "paired"
+    json_file: "../../src/unigradicon/finetuning/configs/kidney_finetuning_pairs_roi.json"
+    use_cache: false
+    weight: 1.0
+    is_ct: false
+    quantile_range: [0.005, 0.995]
+    ct_window: [-1000, 1000]

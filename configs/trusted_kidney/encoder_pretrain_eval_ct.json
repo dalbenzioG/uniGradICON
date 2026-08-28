@@ -1,0 +1,40 @@
+{
+  "data": [
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_images/206L_imgCT.nii.gz",
+      "subject_id": "206_L",
+      "modality": "ct",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_masks/206L_maskCT.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_images/258R_imgCT.nii.gz",
+      "subject_id": "258_R",
+      "modality": "ct",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_masks/258R_maskCT.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_images/348L_imgCT.nii.gz",
+      "subject_id": "348_L",
+      "modality": "ct",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_masks/348L_maskCT.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_images/371R_imgCT.nii.gz",
+      "subject_id": "371_R",
+      "modality": "ct",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_masks/371R_maskCT.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_images/641R_imgCT.nii.gz",
+      "subject_id": "641_R",
+      "modality": "ct",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_masks/641R_maskCT.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_images/721L_imgCT.nii.gz",
+      "subject_id": "721_L",
+      "modality": "ct",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/test/CT_DATA/CT_masks/721L_maskCT.nii.gz"
+    }
+  ]
+}

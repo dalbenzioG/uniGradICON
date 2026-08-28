@@ -313,6 +313,16 @@ unigradicon-register \
 | `contrastive_normalize_features` | bool | L2-normalize feature channels before contrastive loss | true |
 | `contrastive_preop_encoder_checkpoint` | str/null | Checkpoint for CT/MR(preop) frozen encoder module | null |
 | `contrastive_us_encoder_checkpoint` | str/null | Checkpoint for ultrasound frozen encoder module | null |
+| `contrareg_enabled` | bool | Enable ContraReg-style patch NCE branch (mutually exclusive with `use_contrastive_loss`) | false |
+| `contrareg_weight` | float | Weight for the ContraReg loss term | 0.01 |
+| `contrareg_num_patches` | int | Sampled patch locations per feature level | 512 |
+| `contrareg_temperature` | float | PatchNCE temperature (>0) | 0.07 |
+| `contrareg_embed_dim` | int | Projection MLP embedding dim | 256 |
+| `contrareg_feature_channels` | list | Per-level encoder channels (must match AE arch) | [32, 64, 128] |
+| `contrareg_bidirectional` | bool | Also compute the swapped NCE term | false |
+| `contrareg_roi_patches` | bool | Restrict patch sampling to the ROI mask (requires `mask` in JSON) | false |
+| `contrareg_preop_ae_checkpoint` | str/null | Frozen preop (CT/MR) autoencoder checkpoint | null |
+| `contrareg_us_ae_checkpoint` | str/null | Frozen ultrasound autoencoder checkpoint | null |
 | `loss_function_masking` | bool | Restrict similarity loss to masked regions (requires `mask` in JSON) | false |
 | `roi_masking` | bool | Crop images to ROI before registration (requires `mask` in JSON) | false |
 | `use_label` | bool | Label randomization for modality-invariant training (see below) | false |
@@ -463,9 +473,21 @@ training:
 
 Total loss: `L_total = lambda * L_inverse_consistency + L_similarity + dice_loss_weight * L_dice + contrastive_loss_weight_current * L_contrastive`
 
-### Optional Frozen Contrastive Loss
+### Optional Contrastive Branches (dense InfoNCE / ContraReg patch NCE)
 
-The contrastive branch is loss-side only: registration architecture stays unchanged. Features are extracted by frozen pretrained encoders under `torch.no_grad()`, then warped with the predicted deformation field so gradients still flow to registration parameters.
+Two mutually-exclusive contrastive auxiliary losses are available; both consume the same
+frozen per-modality autoencoder checkpoints (pretrained with `training/train_encoders.py`):
+
+- **Dense InfoNCE** (`use_contrastive_loss`, shown below): frozen-encoder features at one
+  level, warped with the predicted deformation field; no extra trainable parameters.
+- **ContraReg patch NCE** (`contrareg_enabled`): multi-scale patchwise NCE with trainable
+  projection MLPs, modeled on ContraReg (Dey et al., MICCAI 2022).
+
+**See [docs/contrastive_branches.md](../../../docs/contrastive_branches.md) for the full
+guide: mechanism, config keys, differences and advantages, and a step-by-step ablation
+recipe.**
+
+The dense contrastive branch is loss-side only: registration architecture stays unchanged. Features are extracted by frozen pretrained encoders under `torch.no_grad()`, then warped with the predicted deformation field so gradients still flow to registration parameters.
 
 ```yaml
 training:

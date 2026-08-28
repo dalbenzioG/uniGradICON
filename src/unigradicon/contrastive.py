@@ -5,8 +5,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-_PREOP_MODALITIES = {"ct", "mri", "mr", "preop"}
-_US_MODALITIES = {"us", "ultrasound"}
+# Shared modality vocabulary for routing images to per-modality encoders.
+# Also used by the ContraReg branch (unigradicon.contrareg).
+PREOP_MODALITIES = frozenset({"ct", "mri", "mr", "preop"})
+US_MODALITIES = frozenset({"us", "ultrasound"})
+
+# Backward-compatible aliases.
+_PREOP_MODALITIES = PREOP_MODALITIES
+_US_MODALITIES = US_MODALITIES
 
 
 def _extract_state_dict(raw_state):

@@ -1,0 +1,50 @@
+experiment:
+  name: "trusted_ct_us_seg_dense_infonce_mind_dice_roi_fixed"
+  model_weights: "C:/Users/gabridal/Documents/TRUSTED_reg/weights/Step_2_final.trch"
+  use_wandb: true
+  wandb_project: "multigradicon-finetune"
+  wandb_entity: null
+  wandb_run_name: "trusted_ct_us_finetuning_200epochs_dense_infonce_mind_dice_roi"
+
+# Dense voxel-wise InfoNCE ablation: identical to
+# config_trusted_ct_us_seg_contrastive_mind_dice.yaml except the contrastive
+# branch (dense InfoNCE instead of ContraReg patch NCE). See
+# docs/contrastive_branches.md for the branch comparison and full recipe.
+training:
+  batch_size: 1
+  gpus: [0]
+  epochs: 200
+  eval_period: 10
+  save_period: 50
+  learning_rate: 0.00005
+  input_shape: [175, 175, 175]
+  similarity: "mind"
+  mind_radius: 2          # optional (default 2)
+  mind_dilation: 2        # optional (default 2)
+  lambda: 1.5
+  dice_loss_weight: 0.3
+  roi_masking: true
+  contrareg_enabled: false      # ablation: dense branch instead of patch NCE
+  use_contrastive_loss: true
+  contrastive_loss_weight: 0.01 # same weight as contrareg_weight in the sibling
+                                # config; initial magnitudes are comparable
+                                # (~log(2048)=7.6 dense vs ~6.4 observed patch NCE)
+  contrastive_temperature: 0.1
+  contrastive_num_samples: 2048
+  contrastive_warmup_epochs: 0  # no warmup, matching the ContraReg run
+  contrastive_feature_level: null  # null = take from checkpoint metadata (-2, 64 ch)
+  contrastive_normalize_features: true
+  # Same encoder checkpoints as the ContraReg config — one pretraining run
+  # (training/train_encoders.py) feeds both branches.
+  contrastive_preop_encoder_checkpoint: "results/encoder_pretrain/preop_encoder.ckpt"
+  contrastive_us_encoder_checkpoint: "results/encoder_pretrain/us_encoder.ckpt"
+
+datasets:
+  - name: "kidney_ct_us_paired"
+    type: "paired"
+    json_file: "../../src/unigradicon/finetuning/configs/kidney_finetuning_pairs_roi.json"
+    use_cache: false
+    weight: 1.0
+    is_ct: false
+    quantile_range: [0.005, 0.995]
+    ct_window: [-1000, 1000]

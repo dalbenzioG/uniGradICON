@@ -1,0 +1,322 @@
+{
+  "data": [
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/200R_imgUS.nii.gz",
+      "subject_id": "200_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/200R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/206R_imgUS.nii.gz",
+      "subject_id": "206_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/206R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/220R_imgUS.nii.gz",
+      "subject_id": "220_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/220R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/250L_imgUS.nii.gz",
+      "subject_id": "250_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/250L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/250R_imgUS.nii.gz",
+      "subject_id": "250_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/250R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/258L_imgUS.nii.gz",
+      "subject_id": "258_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/258L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/263L_imgUS.nii.gz",
+      "subject_id": "263_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/263L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/263R_imgUS.nii.gz",
+      "subject_id": "263_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/263R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/283L_imgUS.nii.gz",
+      "subject_id": "283_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/283L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/314L_imgUS.nii.gz",
+      "subject_id": "314_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/314L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/314R_imgUS.nii.gz",
+      "subject_id": "314_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/314R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/329L_imgUS.nii.gz",
+      "subject_id": "329_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/329L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/329R_imgUS.nii.gz",
+      "subject_id": "329_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/329R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/348R_imgUS.nii.gz",
+      "subject_id": "348_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/348R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/398R_imgUS.nii.gz",
+      "subject_id": "398_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/398R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/399R_imgUS.nii.gz",
+      "subject_id": "399_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/399R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/418L_imgUS.nii.gz",
+      "subject_id": "418_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/418L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/418R_imgUS.nii.gz",
+      "subject_id": "418_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/418R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/443R_imgUS.nii.gz",
+      "subject_id": "443_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/443R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/466L_imgUS.nii.gz",
+      "subject_id": "466_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/466L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/466R_imgUS.nii.gz",
+      "subject_id": "466_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/466R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/506L_imgUS.nii.gz",
+      "subject_id": "506_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/506L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/506R_imgUS.nii.gz",
+      "subject_id": "506_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/506R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/510L_imgUS.nii.gz",
+      "subject_id": "510_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/510L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/510R_imgUS.nii.gz",
+      "subject_id": "510_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/510R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/517L_imgUS.nii.gz",
+      "subject_id": "517_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/517L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/517R_imgUS.nii.gz",
+      "subject_id": "517_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/517R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/532L_imgUS.nii.gz",
+      "subject_id": "532_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/532L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/532R_imgUS.nii.gz",
+      "subject_id": "532_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/532R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/561R_imgUS.nii.gz",
+      "subject_id": "561_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/561R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/579L_imgUS.nii.gz",
+      "subject_id": "579_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/579L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/579R_imgUS.nii.gz",
+      "subject_id": "579_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/579R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/592R_imgUS.nii.gz",
+      "subject_id": "592_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/592R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/610L_imgUS.nii.gz",
+      "subject_id": "610_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/610L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/636R_imgUS.nii.gz",
+      "subject_id": "636_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/636R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/641L_imgUS.nii.gz",
+      "subject_id": "641_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/641L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/680L_imgUS.nii.gz",
+      "subject_id": "680_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/680L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/701L_imgUS.nii.gz",
+      "subject_id": "701_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/701L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/701R_imgUS.nii.gz",
+      "subject_id": "701_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/701R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/704L_imgUS.nii.gz",
+      "subject_id": "704_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/704L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/711L_imgUS.nii.gz",
+      "subject_id": "711_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/711L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/716R_imgUS.nii.gz",
+      "subject_id": "716_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/716R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/735R_imgUS.nii.gz",
+      "subject_id": "735_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/735R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/738R_imgUS.nii.gz",
+      "subject_id": "738_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/738R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/755L_imgUS.nii.gz",
+      "subject_id": "755_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/755L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/755R_imgUS.nii.gz",
+      "subject_id": "755_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/755R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/794L_imgUS.nii.gz",
+      "subject_id": "794_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/794L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/794R_imgUS.nii.gz",
+      "subject_id": "794_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/794R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/861L_imgUS.nii.gz",
+      "subject_id": "861_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/861L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/861R_imgUS.nii.gz",
+      "subject_id": "861_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/861R_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/915L_imgUS.nii.gz",
+      "subject_id": "915_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/915L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/948L_imgUS.nii.gz",
+      "subject_id": "948_L",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/948L_maskUS.nii.gz"
+    },
+    {
+      "image": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_images/948R_imgUS.nii.gz",
+      "subject_id": "948_R",
+      "modality": "us",
+      "segmentation": "C:/Users/gabridal/Documents/TRUSTED_reg/train/US_masks/948R_maskUS.nii.gz"
+    }
+  ]
+}

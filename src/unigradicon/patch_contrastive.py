@@ -1,10 +1,15 @@
 """ContraReg-style patch projection and multi-scale PatchNCE (standalone)."""
 
+import logging
 from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
+
+_MIN_VALID_PATCH_VOXELS = 2
 
 
 class ProjectionMLP(nn.Module):
@@ -63,11 +68,11 @@ class PatchProjector3D(nn.Module):
 
             batch_size = feat.shape[0]
             spatial_size = int(feat.shape[2:].numel())
-            num_sampled = min(num_patches, spatial_size)
 
             feat_flat = feat.permute(0, 2, 3, 4, 1).reshape(batch_size, spatial_size, expected_channels)
 
             if patch_ids is None:
+                num_sampled = min(num_patches, spatial_size)
                 level_patch_ids = torch.randperm(spatial_size, device=feat.device)[:num_sampled]
             else:
                 level_patch_ids = patch_ids[level_idx]
@@ -75,12 +80,61 @@ class PatchProjector3D(nn.Module):
                     level_patch_ids = torch.tensor(level_patch_ids, dtype=torch.long, device=feat.device)
                 else:
                     level_patch_ids = level_patch_ids.to(device=feat.device, dtype=torch.long)
+                # Supplied ids (e.g. ROI-restricted) may be fewer than
+                # num_patches; size the projection from what was given.
+                num_sampled = int(level_patch_ids.numel())
 
             sampled = feat_flat[:, level_patch_ids, :]
             projected.append(mlp(sampled.reshape(batch_size * num_sampled, expected_channels)))
             out_patch_ids.append(level_patch_ids)
 
         return projected, out_patch_ids
+
+
+def sample_patch_ids_from_mask(
+    mask: torch.Tensor,
+    feature_shapes: Sequence[torch.Size],
+    num_patches: int,
+) -> List[torch.Tensor]:
+    """Sample per-level patch ids restricted to an ROI mask.
+
+    Args:
+        mask: ``[B, 1, D, H, W]`` mask on the fixed grid (both the fixed and
+            warped-moving feature stacks live on that grid). When ``B > 1``
+            the mask is intersected across batch items so one shared id set
+            stays valid for every item (in practice batch size is 1).
+        feature_shapes: One ``[B, C, d, h, w]`` shape per feature level.
+        num_patches: Requested patches per level (capped at the valid count).
+
+    Returns:
+        One 1-D LongTensor of flattened spatial indices per feature level.
+        Falls back to uniform sampling at levels where the downsampled mask
+        has fewer than two valid voxels.
+    """
+    if mask.dim() != 5:
+        raise ValueError(f"mask must be 5D [B, 1, D, H, W], got {tuple(mask.shape)}.")
+    valid = (mask > 0).float()
+    if valid.shape[0] > 1:
+        valid = valid.prod(dim=0, keepdim=True)
+    valid = valid[:, :1]
+
+    patch_ids: List[torch.Tensor] = []
+    for level_idx, feat_shape in enumerate(feature_shapes):
+        spatial = tuple(feat_shape[2:])
+        level_valid = F.interpolate(valid, size=spatial, mode="nearest")
+        valid_indices = torch.nonzero(level_valid.flatten(), as_tuple=False).squeeze(1)
+        spatial_size = int(level_valid.numel())
+        if valid_indices.numel() < _MIN_VALID_PATCH_VOXELS:
+            logger.warning(
+                f"ROI mask covers {valid_indices.numel()} voxel(s) at feature level "
+                f"{level_idx} (size {spatial}); falling back to uniform patch sampling."
+            )
+            patch_ids.append(torch.randperm(spatial_size, device=mask.device)[:num_patches])
+            continue
+        num_sampled = min(num_patches, int(valid_indices.numel()))
+        perm = torch.randperm(valid_indices.numel(), device=mask.device)[:num_sampled]
+        patch_ids.append(valid_indices[perm])
+    return patch_ids
 
 
 def patch_nce_loss(
